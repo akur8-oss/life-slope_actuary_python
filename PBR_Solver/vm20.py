@@ -121,7 +121,7 @@ class VM20:
                 logging.info(f"Asset Collar Solver: Tolerance not met with full rerun.")
 
             for step in self.__solver_steps:
-                logging.info(f"Iteration: {step['Iteration']}, Guess: {step['Guess']}, Difference: {step['Difference']}, DifferencePct: {step['DifferencePct']}")
+                logging.info(f"Iteration: {step['Iteration']}, Guess: {step['Guess']:,.2f}, Difference: {step['Difference']:,.2f}, DifferencePct: {step['DifferencePct']}")
 
             return solver_assets, stochastic_projection_id
             
@@ -146,8 +146,8 @@ class VM20:
         logging.debug(f"Creating Starting Assets table for guess number {guess_num} with value {starting_assets}")
         # This assumes the layout of the Initial Asset Scaling table has not been changed
         data = [
-            ["Scenario #", "Scaling Factor", "Scaling Target"],
-            ['', '', starting_assets]
+            ["Portfolio Name","Scenario #", "asset Scaling Method", "Scaling Factor", "Scaling Target Basis", "Scaling Target"],
+            ['', '', 'Use Asset Scaling Amount/Factor', '', 'US STAT Reported Value', starting_assets]
         ]
 
         with open(filename, 'w', newline='') as csvfile:
@@ -236,6 +236,16 @@ class VM20:
         report = SigmaReport(self.api, self.params.reports.get("Starting Assets"))
         report.retrieve({"Projection-ID": str(projection_id)})
         starting_assets_df = report.get_data()
+
+        if starting_assets_df.empty:
+            # Snowflake may have not yet loaded with final results, wait and retry a few times to see
+            for attempt in range(5):
+                time.sleep(10)  # Wait 10 seconds before retrying
+                report.retrieve({"Projection-ID": str(projection_id)})
+                starting_assets_df = report.get_data()
+                if not starting_assets_df.empty:
+                    break
+
         if starting_assets_df.empty:
             raise ValueError("No starting assets found in the report.")
 
@@ -263,7 +273,7 @@ class VM20:
         if scenario_values.empty:
             # Snowflake may have not yet loaded with final results, wait and retry a few times to see
             for attempt in range(5):
-                time.sleep(20)  # Wait 20 seconds before retrying
+                time.sleep(10)  # Wait 10 seconds before retrying
                 report.retrieve({"Projection-ID": f"{projection_id}"})
                 scenario_values = report.get_data()
                 if not scenario_values.empty:
@@ -292,7 +302,13 @@ class VM20:
         projection_id = self.api.copy_projection(copy_from_projection_id, name, False)
         starting_asset_table_id = self.__create_starting_asset_table(starting_assets, 0)
         self.api.update_projection(projection_id, {
-            "scenarioSubset": scenarioList
+            "scenarioSubset": scenarioList,
+            "dataTables": [
+                {
+                    "tableStructureName": self.params.starting_assets_table_structure_name,
+                    "dataTableId": starting_asset_table_id
+                }
+            ]
         })
         self.api.run_projection(projection_id)
         return projection_id
@@ -338,6 +354,14 @@ class VM20:
                 # Wait for the projection to complete
                 self.api.wait_for_completion(projection_id)
 
+                # Check that starting assets in projection match the guess
+                starting_asset_check = self.__get_starting_assets(projection_id)
+                if abs(starting_asset_check - current_guess) > 1.0:
+                    logging.error(f"Error: Starting assets in projection ({starting_asset_check}) do not match guess ({current_guess})")
+                    logging.error("This may indicate an issue with the Starting Assets data table upload or projection setup." \
+                    " Please verify the projection configuration.")
+                    raise ValueError(f"Starting assets mismatch: expected {current_guess}, got {starting_asset_check}")
+                
                 stochastic_reserve = self.__get_stochastic_reserve(projection_id, full_scenario_set=False)
                 current_diff = stochastic_reserve - current_guess
                 current_diff_pct = "{:.2%}".format(current_diff/current_guess)
@@ -349,13 +373,12 @@ class VM20:
 
                 if abs(current_diff) <= self.asset_collar_tolerance * current_guess:
                     # If the difference is within the tolerance, return the current guess
-                    logging.info(f"Asset Collar Solver: Tolerance met with guess {current_guess} and difference {current_diff} ({current_diff_pct}).")
+                    logging.info(f"Asset Collar Solver: Tolerance met with guess {current_guess:,.2f} and difference {current_diff:,.2f} ({current_diff_pct}).")
                     return current_guess
                 
                 #Calculate next guess using secant method
                 next_guess = current_guess - current_diff * (current_guess - last_guess) / (current_diff - last_diff)
-                logging.info(f"Asset Collar Solver: Iteration {i+1}, Current Guess: {current_guess}, Current Difference: {current_diff} ({current_diff_pct}), Last Guess: {last_guess}, Last Difference: {last_diff} ({last_diff_pct}), Next Guess: {next_guess}")
-                
+                logging.info(f"Asset Collar Solver: Iteration {i+1}, Current Guess: {current_guess:,.2f}, Current Difference: {current_diff:,.2f} ({current_diff_pct}), Last Guess: {last_guess:,.2f}, Last Difference: {last_diff:,.2f} ({last_diff_pct}), Next Guess: {next_guess:,.2f}")
                 last_guess, last_diff = current_guess, current_diff
                 last_diff_pct = current_diff_pct
                 current_guess = next_guess

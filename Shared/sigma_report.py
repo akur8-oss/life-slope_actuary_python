@@ -13,7 +13,7 @@ class SigmaReportParams:
     workbook_id: str
     element_id: str
     filter_params: Dict[str, str]
-    working_directory: str = r'C:\\Slope API'
+    working_directory: str = r'C:\Slope API'
     row_batch_size: int = 1000000
 
     @staticmethod
