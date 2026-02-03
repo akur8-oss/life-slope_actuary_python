@@ -12,7 +12,7 @@ import os
 import json
 
 # Projection ID to Solve
-projection_id = 162261  # Replace with your actual projection ID
+projection_id = 163450  # Replace with your actual projection ID
 
 # Change this to appropriate level for your run
 logging_level = logging.INFO
@@ -75,5 +75,5 @@ if __name__ == '__main__':
     # Run VM-20 Solver Process
     vm20_solver = VM20(params)
     assets, projection_id = vm20_solver.solve_asset_collar(projection_id, restart_params)
-    logging.info(f"Final Assets: {assets}, Projection ID: {projection_id}")
+    logging.info(f"Final Assets: {assets:,.2f}, Projection ID: https://app.slopesoftware.com/ModelResults/FinancialProjection/DetailsTabView/{projection_id}")
     logging.info(f"VM-20 Solver Process Completed Successfully.")
