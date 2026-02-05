@@ -4,6 +4,7 @@ This Library contains sets of projects and workflows that have been built for va
 Each subfolder represents a separate project or workflow for a specific purpose.
 The `Shared` folder contains common utility classes or functions that are used by multiple projects.
 When using specific project folders, you may need to include the `Shared` folder contents as well for the project to work.
+See `PBR_Solver/README.md` for details on the VM-20 PBR solver workflow.
 
 ## VS Code Extensions
 This project was built to work with VS Code and utilizes the following extensions:
