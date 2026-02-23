@@ -19,6 +19,29 @@ Example:
 pip install requests pandas python-dateutil urllib3
 ```
 
+### Quick Start: Run `main.py`
+1. **Verify Python version**:
+   ```bash
+   python --version
+   ```
+2. **Install dependencies** (if not already installed):
+   ```bash
+   pip install requests pandas python-dateutil urllib3
+   ```
+3. **Set credentials** in `Shared/keys.py`:
+   - `api_key`
+   - `api_secret`
+4. **Set inputs** in `PBR_Solver/main.py`:
+   - `projection_id = <your projection id>`
+   - Optional: adjust `logging_level`
+5. **Run from the repo root**:
+   ```bash
+   python PBR_Solver/main.py
+   ```
+
+Notes:
+- Working files are written to `c:\Slope API\VM20` by default (see `VM20Params.working_directory`).【F:PBR_Solver/vm20_params.py†L5-L18】
+
 ### Folder structure
 Key directories/files under `PBR_Solver`:
 - `main.py`: Entry point configuring parameters and launching the solver.【F:PBR_Solver/main.py†L14-L74】
