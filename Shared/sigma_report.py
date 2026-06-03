@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Queue
 import logging
 import os
@@ -8,12 +9,19 @@ from typing import Any, Dict
 import csv
 import uuid
 
+# Base folder for downloaded report files (a "Reports" subfolder is added below).
+# Override per-machine with the SLOPE_REPORTS_DIR env var; otherwise default to
+# a folder under the user's home directory (works on Windows and macOS).
+_DEFAULT_REPORTS_BASE = Path(
+    os.environ.get("SLOPE_REPORTS_DIR", Path.home() / "Slope API")
+)
+
 @dataclass
 class SigmaReportParams:
     workbook_id: str
     element_id: str
     filter_params: Dict[str, str]
-    working_directory: str = r'C:\Slope API'
+    working_directory: Path = _DEFAULT_REPORTS_BASE
     row_batch_size: int = 1000000
 
     @staticmethod
@@ -25,22 +33,21 @@ class SigmaReportParams:
         return SigmaReportParams(_workbook, _element, _filters, row_batch_size=_row_batch_size)
 
 class SigmaReport:
-    __filename: str = None
+    __filename: Path = None
     __data: pd.DataFrame = None
 
     def __init__(self, api: SlopeApi, params: SigmaReportParams, filepath: str = None):
         self.api = api
-        self.working_directory = params.working_directory + "\\Reports"
+        self.working_directory = Path(params.working_directory) / "Reports"
         self.workbook_id = params.workbook_id
         self.element_id = params.element_id
         self.filters = params.filter_params
         self.row_batch_size = params.row_batch_size
 
         if filepath is not None:
-            self.working_directory = filepath
+            self.working_directory = Path(filepath)
 
-        if not os.path.exists(self.working_directory):
-            os.makedirs(self.working_directory)
+        self.working_directory.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def __combine_csv_segments(segments: list, output_filename: str):
@@ -80,10 +87,10 @@ class SigmaReport:
 
         return self.__data
         
-    def get_filename(self) -> str:  
+    def get_filename(self) -> str:
         if self.__filename is None:
             raise ValueError("Report data has not been retrieved yet. Call retrieve() first.")
-        return self.__filename
+        return str(self.__filename)
     
     def retrieve(self, filter_values: dict, filename: str = None):
         num_segments = 0
@@ -96,9 +103,9 @@ class SigmaReport:
         self.__data = None  # Clear any existing data
 
         if filename is None:
-            self.__filename = f'{self.working_directory}\\{self.workbook_id}_{self.element_id}_{unique_id}.csv'
+            self.__filename = self.working_directory / f'{self.workbook_id}_{self.element_id}_{unique_id}.csv'
         else:
-            self.__filename = filename
+            self.__filename = Path(filename)
 
         report_params = self.__get_report_params(filter_values)
 
@@ -108,7 +115,7 @@ class SigmaReport:
             # Download the report segment
             logging.debug(f"Downloading report segment {num_segments} for workbook {self.workbook_id}, element {self.element_id}, offset {offset}")
             
-            segment_filename = f'{self.working_directory}\\{self.workbook_id}_{self.element_id}_{num_segments}_{unique_id}.csv'
+            segment_filename = self.working_directory / f'{self.workbook_id}_{self.element_id}_{num_segments}_{unique_id}.csv'
             self.api.download_report(self.workbook_id, self.element_id, segment_filename, "Csv", report_params, row_limit=self.row_batch_size, offset=offset)
             report_segments.append(segment_filename)
             

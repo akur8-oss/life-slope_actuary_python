@@ -1,0 +1,15 @@
+[project]
+name = "slope-actuarial-scripts"
+version = "0.1.0"
+description = "SLOPE Actuarial Scripts Library — PBR and SBA solver workflows sharing common Slope API utilities."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "openpyxl>=3.1.5",
+    "pandas>=2.2.3",
+    "python-dateutil>=2.9.0.post0",
+    "requests>=2.32.3",
+    # xlwings drives the installed MS Excel to recalculate workbook formulas
+    # (SBA_Solver). Cross-platform: macOS via AppleScript, Windows via COM.
+    "xlwings>=0.31",
+]
