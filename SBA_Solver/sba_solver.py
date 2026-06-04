@@ -411,7 +411,7 @@ class SbaSolver:
         df['Scenario #'] = range(len(df))
         df['Scaling Factor'] = None
         df['Asset Scaling Method'] = "Use Asset Scaling Amount/Factor"
-        df['Scaling Target Basis'] = None
+        df['Scaling Target Basis'] = "Market Value"
         df['Portfolio Name'] = None
         starting_assets_file = self.solver_folder / "sba_assets.csv"
         df.to_csv(starting_assets_file, index=False)
