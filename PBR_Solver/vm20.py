@@ -1,8 +1,8 @@
 import csv
 import logging
 import math
-import os
 import time
+from pathlib import Path
 from guess_iteration import GuessIteration
 from Shared.sigma_report import SigmaReport
 from Shared.slope_api import SlopeApi
@@ -17,7 +17,7 @@ class VM20:
     
     asset_collar_tolerance: float = 0.02
     slope_file_path: str
-    working_directory: str
+    working_directory: Path
 
     __epl_table_id: int = None
     __epl_table_structure_id: int = None
@@ -47,9 +47,8 @@ class VM20:
 
             # Set up working directory paths locally and in SLOPE
             self.slope_file_path = f'PBR Solver/Projection-{sr_projection_id}'
-            self.working_directory = f'{self.params.working_directory}\\Projection-{sr_projection_id}'
-            if not os.path.exists(self.working_directory):
-                os.makedirs(self.working_directory)
+            self.working_directory = self.params.working_directory / f'Projection-{sr_projection_id}'
+            self.working_directory.mkdir(parents=True, exist_ok=True)
 
             # projection_id should have been run with assets = NPR as starting point
             if self.restart_params is not None and self.restart_params.starting_assets is not None:
@@ -139,7 +138,7 @@ class VM20:
     
     def __create_starting_asset_table(self, starting_assets, guess_num: int):
         
-        filename = f"{self.working_directory}\\Starting_Assets.csv"
+        filename = self.working_directory / "Starting_Assets.csv"
         projection_id = self.base_projection_details['id']
 
         # Create a data table for the starting asset value

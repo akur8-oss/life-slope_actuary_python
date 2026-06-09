@@ -1,12 +1,21 @@
+import os
+from pathlib import Path
 from Shared.keys import api_key as key, api_secret as secret
 
 # Substitute Real API credentials here
 api_key = key
 api_secret = secret
 
-solver_folder = "C:\\Slope Api\\SBA Solver\\"     # Temporary folder on this computer for storing data
+# Scratch/working folder for intermediate solver files.
+# Override per-machine with the SLOPE_WORKING_DIR env var; otherwise default
+# to a folder under the user's home directory (works on Windows and macOS).
+solver_folder = Path(
+    os.environ.get("SLOPE_WORKING_DIR", Path.home() / "Slope API" / "SBA Solver")
+)
 
-sba_scenario_generator = solver_folder + "SBA Scenario Generator.xlsx"
+# Versioned input template that ships in the repo alongside this script,
+# resolved relative to this file so it works on any OS without manual copying.
+sba_scenario_generator = Path(__file__).parent / "SBA Scenario Generator.xlsx"
 
 # Usage Notes
 # The sba_template_name specified in this setting MUST have the following:
@@ -23,6 +32,6 @@ starting_asset_table_name = "Initial Asset Scaling"          # The name of the s
 epl_table_name = "EPL Inputs"                                # The name of the EPL Input Table
 virtual_folder_name = "SBA Solver"                           # The name of the virtual folder in SLOPE to store projections in Slope
 
-solver_final_asset_tolerance = 5000000        # tolerance for remaining assets for the BEL solve - Higher tolerances will converge faster
+solver_final_asset_tolerance = 100000        # tolerance for remaining assets for the BEL solve - Higher tolerances will converge faster
 solver_max_iterations = 4                   # The maximum number of attempts to solve for BEL. If max iterations is exceeded, the last closes guess outside the tolerance will be used
 next_guess_range = 0.20                     # Check a 20% weighted average range around the last guess

@@ -4,12 +4,11 @@ import pandas as pd
 import logging
 import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows
-import os
 import settings
 from Shared.sigma_report import SigmaReport, SigmaReportParams
 from Shared.slope_api import SlopeApi
 import time
-import win32com.client as win32
+import xlwings as xw
 
 
 class SbaSolver:
@@ -36,9 +35,8 @@ class SbaSolver:
         self.base_projection_id = projection_id
         self.api = SlopeApi()
         self.api.authorize(settings.api_key, settings.api_secret)
-        self.solver_folder = f"{settings.solver_folder}\\{projection_id}\\"
-        if not os.path.exists(self.solver_folder):
-            os.makedirs(self.solver_folder)
+        self.solver_folder = settings.solver_folder / str(projection_id)
+        self.solver_folder.mkdir(parents=True, exist_ok=True)
         self.slope_file_path = f"SBA Solver/{projection_id}"
         self.max_error = "Unknown"
         pd.options.display.float_format = '{:,.2f}'.format
@@ -190,7 +188,7 @@ class SbaSolver:
         scenario_report.retrieve(report_params)
         spot_curve = scenario_report.get_data()
 
-        scenario_file = self.solver_folder + f"sba_scenarios_time_{time_index}.xlsx"
+        scenario_file = self.solver_folder / f"sba_scenarios_time_{time_index}.xlsx"
         logging.info(f"Creating new SBA scenario file at '{scenario_file}'")
         scenario_generator = openpyxl.load_workbook(filename=settings.sba_scenario_generator, read_only=False)
         sheet = scenario_generator["Input"]
@@ -206,14 +204,18 @@ class SbaSolver:
         scenario_generator.close()
 
         # openpyxl is great for updating data, but it doesn't recalculate formulas, which is kind of important for this step
-        # Open, Save, and close the workbook using Excel through a COM call to re-save it with formulas updated
-        # This step only works on a Windows OS with MS Excel installed (sorry)
-        # If you get weird COM errors in this section, it is probably due to an open dialog stuck in Excel. Manually close all Excel files and rerun
-        excel = win32.DispatchEx('Excel.Application')
-        workbook = excel.Workbooks.Open(scenario_file)
-        workbook.Save()
-        workbook.Close()
-        excel.Quit()
+        # Open, recalculate, save, and close the workbook using Excel so it is re-saved with formulas updated
+        # xlwings drives the installed MS Excel on both macOS (AppleScript) and Windows (COM), so this is cross-platform
+        # Requires MS Excel to be installed. If Excel hangs, it is usually a stuck open dialog -- close all Excel windows and rerun
+        excel = xw.App(visible=False)
+        try:
+            # xlwings (appscript on macOS) needs an absolute path string
+            workbook = excel.books.open(str(scenario_file.resolve()))
+            excel.calculate()
+            workbook.save()
+            workbook.close()
+        finally:
+            excel.quit()
 
         # Upload SBA Scenarios to SLOPE
         logging.info(f"Load scenario file to slope at '{self.slope_file_path}/Time-{time_index} SBA Scenarios.xlsx'")
@@ -408,7 +410,10 @@ class SbaSolver:
         df = df.rename(columns={df.columns[0]: "Scaling Target"})
         df['Scenario #'] = range(len(df))
         df['Scaling Factor'] = None
-        starting_assets_file = self.solver_folder + "sba_assets.csv"
+        df['Asset Scaling Method'] = "Use Asset Scaling Amount/Factor"
+        df['Scaling Target Basis'] = "Market Value"
+        df['Portfolio Name'] = None
+        starting_assets_file = self.solver_folder / "sba_assets.csv"
         df.to_csv(starting_assets_file, index=False)
         logging.info(f"Starting run for BEL solve:")
         logging.info(df)

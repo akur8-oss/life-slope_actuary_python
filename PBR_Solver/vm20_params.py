@@ -1,6 +1,15 @@
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from guess_iteration import GuessIteration
 from Shared.sigma_report import SigmaReportParams
+
+# Scratch/working folder for intermediate solver files.
+# Override per-machine with the VM20_WORKING_DIR env var; otherwise default
+# to a folder under the user's home directory (works on Windows and macOS).
+_DEFAULT_VM20_DIR = Path(
+    os.environ.get("VM20_WORKING_DIR", Path.home() / "Slope API" / "VM20")
+)
 
 @dataclass
 class VM20Params:
@@ -12,7 +21,7 @@ class VM20Params:
     max_iterations: int
     pbr_projection_template_name: str
     reports: dict[str, SigmaReportParams] = None
-    working_directory: str = r'c:\Slope API\VM20'
+    working_directory: Path = _DEFAULT_VM20_DIR
     projection_virtual_folder = "VM-20 Solver"
     epl_table_structure_name: str = "EPL Inputs"
     starting_assets_table_structure_name: str = "Initial Asset Scaling"
