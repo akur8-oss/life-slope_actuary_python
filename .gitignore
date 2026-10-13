@@ -13,3 +13,8 @@ wheels/
 # API Keys - Local Only
 */keys.py
 Shared/keys.py
+
+# Environment files with credentials - Local Only
+.env
+.env.*
+!.env.example

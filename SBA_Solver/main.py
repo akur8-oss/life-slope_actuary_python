@@ -11,11 +11,18 @@ from Shared.sigma_report import SigmaReportParams
 
 # SBA Solver parameters
 # The ID of the base liability cash flow projection
-base_projection_id = 59776
+base_projection_id = 200794
 
 # List of the pivot points at which you want to run the solver. It will solve for BEL at ech of these time points in the above projection
 solver_time_points = [0]
 # solver_time_points = [0, 12, 24, 36, 48, 60, 120, 240]
+
+# Optional starting-asset guess for the solver to start from instead of deriving one from the market value of liabilities
+# None derives the guess at every time point. Use a single value for every time point, or a dict keyed by time point
+# (time points not in the dict derive their own). The first guesses bracket this value at 95%, 99.5% and 110%
+# initial_guess = None
+initial_guess = 2684364663
+# initial_guess = {0: 1500000000, 12: 1450000000}
 
 
 def setup_logging():
@@ -48,7 +55,7 @@ def run():
     reports = get_reports_data()
     solver = sba_solver.SbaSolver(base_projection_id, reports)
 
-    solver.calculate_bel(solver_time_points)
+    solver.calculate_bel(solver_time_points, initial_guess)
     solver.print_results()
 
 

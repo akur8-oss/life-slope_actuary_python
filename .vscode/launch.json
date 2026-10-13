@@ -12,6 +12,7 @@
             "module": "main",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}/SBA_Solver",
+            "python": "${workspaceFolder}/SBA_Solver/.venv/bin/python",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/SBA_Solver"
             },
@@ -23,6 +24,7 @@
             "module": "main",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}/PBR_Solver",
+            "python": "${workspaceFolder}/PBR_Solver/.venv/bin/python",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/PBR_Solver"
             },

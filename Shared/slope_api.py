@@ -11,7 +11,8 @@ from urllib3 import Retry
 
 
 class SlopeApi:
-    api_url = "https://api.slopesoftware.com/api/v1"
+    api_url = "https://api.slopesoftware.com/api"
+    max_data_table_rows = 100000  # API limit for row data table endpoints (also limited to 10MB per request)
     __expires: datetime.datetime
     __refresh_token = ""
     __lock = threading.Lock()
@@ -48,8 +49,8 @@ class SlopeApi:
                 "apiKey": key,
                 "apiSecretKey": secret
             }
-            logging.debug(f"Authorizing SLOPE API with key '{key}' and secret '{secret}'")
-            response = self.session.post(f"{self.api_url}/Authorize", json=auth_params)
+            logging.debug("Authorizing SLOPE API")
+            response = self.session.post(f"{self.api_url}/v1/Authorize", json=auth_params)
             self.__check_response(response)
             access_token = response.json()["accessToken"]
             self.session.headers.update({"Authorization": f"Bearer {access_token}"})
@@ -62,7 +63,7 @@ class SlopeApi:
         refresh_params = {
             "refreshToken": self.__refresh_token
         }
-        response = requests.post(f"{self.api_url}/Authorize/Refresh", json=refresh_params, headers={"Content-Type": "application/json"})
+        response = requests.post(f"{self.api_url}/v1/Authorize/Refresh", json=refresh_params, headers={"Content-Type": "application/json"})
         self.__check_response(response)
         access_token = response.json()["accessToken"]
         self.session.headers.update({"Authorization": f"Bearer {access_token}"})
@@ -85,7 +86,7 @@ class SlopeApi:
     def upload_file(self, filename: str, slope_path: str) -> int:
         self.__keep_alive()
         slope_file_params = {"filePath": slope_path}
-        response = self.session.post(f"{self.api_url}/Files/GetUploadUrl", json=slope_file_params)
+        response = self.session.post(f"{self.api_url}/v1/Files/GetUploadUrl", json=slope_file_params)
         upload_url = response.json()["uploadUrl"]
 
         logging.debug(f"Uploading file '{filename}' to '{slope_path}'.")
@@ -95,7 +96,7 @@ class SlopeApi:
         response = requests.put(upload_url, data=open(filename, "rb"))
         self.__check_response(response)
 
-        response = self.session.post(f"{self.api_url}/Files/SaveUpload", json=slope_file_params)
+        response = self.session.post(f"{self.api_url}/v1/Files/SaveUpload", json=slope_file_params)
         self.__check_response(response)
         return response.json()["fileId"]
 
@@ -112,7 +113,7 @@ class SlopeApi:
         self.__keep_alive()
         params = {"projectionName": name, "setTablesToLatestVersion": update_tables}
         logging.debug(f"Copy projection with ID of {projection_id} to new projection named '{name}'.")
-        response = self.session.post(f"{self.api_url}/Projections/{projection_id}/Copy", json=params)
+        response = self.session.post(f"{self.api_url}/v1/Projections/{projection_id}/Copy", json=params)
         self.__check_response(response)
         return response.json()["id"]
     
@@ -121,7 +122,7 @@ class SlopeApi:
         self.__keep_alive()
         self.upload_file(filename, slope_table_params["filePath"])
         logging.debug(f"Creating Data Table with parameters: {slope_table_params}")
-        response = self.session.post(f"{self.api_url}/DataTables", json=slope_table_params)
+        response = self.session.post(f"{self.api_url}/v1/DataTables", json=slope_table_params)
         self.__check_response(response)
         return response.json()["id"]
 
@@ -131,7 +132,7 @@ class SlopeApi:
     def create_or_update_data_table(self, filename: str, slope_table_params) -> int:
         self.__keep_alive()
         self.upload_file(filename, slope_table_params["filePath"])
-        response = self.session.post(f"{self.api_url}/DataTables/0", json=slope_table_params)
+        response = self.session.post(f"{self.api_url}/v1/DataTables/0", json=slope_table_params)
         if response.ok:
             logging.debug(f"Created new Data Table with parameters: {slope_table_params}")
             return response.json()["id"]
@@ -140,7 +141,7 @@ class SlopeApi:
             return None
 
         logging.debug(f"Updating Data Table with parameters: {slope_table_params}")
-        response = self.session.patch(f"{self.api_url}/DataTables", json=slope_table_params)
+        response = self.session.patch(f"{self.api_url}/v1/DataTables", json=slope_table_params)
         self.__check_response(response)
         return response.json()["id"]
     
@@ -150,7 +151,7 @@ class SlopeApi:
         self.upload_file(filename, slope_table_params["filePath"])
         logging.debug(f"Creating Decrement Table with parameters: {slope_table_params}")
         # Check if table already exists and rename to new name
-        response = self.session.post(f"{self.api_url}/DecrementTables", json=slope_table_params)
+        response = self.session.post(f"{self.api_url}/v1/DecrementTables", json=slope_table_params)
         self.__check_response(response)
         return response.json()["id"]
 
@@ -159,7 +160,7 @@ class SlopeApi:
         self.__keep_alive()
         logging.debug(f"Creating Decrement Table with parameters: {slope_table_params}")
         # Check if table already exists and rename to new name
-        response = self.session.post(f"{self.api_url}/DecrementTables", json=slope_table_params)
+        response = self.session.post(f"{self.api_url}/v1/DecrementTables", json=slope_table_params)
         self.__check_response(response)
         return response.json()["id"]
     
@@ -168,7 +169,7 @@ class SlopeApi:
         self.__keep_alive()
         params = {"templateId": template_id, "name": name}
         logging.debug(f"Creating projection from Template {template_id} with name: {name}")
-        response = self.session.post(f"{self.api_url}/Projections", json=params)
+        response = self.session.post(f"{self.api_url}/v1/Projections", json=params)
         self.__check_response(response)
         return response.json()["id"]
     
@@ -177,7 +178,7 @@ class SlopeApi:
         self.__keep_alive()
         self.upload_file(filename, slope_scenario_table_params["filePath"])
         logging.debug(f"Creating scenario table with parameters: {slope_scenario_table_params}")
-        response = self.session.post(f"{self.api_url}/ScenarioTables", json=slope_scenario_table_params)
+        response = self.session.post(f"{self.api_url}/v1/ScenarioTables", json=slope_scenario_table_params)
         self.__check_response(response)
         return response.json()["id"]
     
@@ -187,7 +188,7 @@ class SlopeApi:
     def create_or_update_scenario_table(self, filename: str, slope_scenario_table_params) -> int:
         self.__keep_alive()
         self.upload_file(filename, slope_scenario_table_params["filePath"])
-        response = self.session.post(f"{self.api_url}/ScenarioTables", json=slope_scenario_table_params)
+        response = self.session.post(f"{self.api_url}/v1/ScenarioTables", json=slope_scenario_table_params)
         if response.ok:
             logging.debug(f"Created new Scenario Table with parameters: {slope_scenario_table_params}")
             return response.json()["id"]
@@ -195,13 +196,13 @@ class SlopeApi:
             self.__check_response(response)
             return None
 
-        response = self.session.get(f"{self.api_url}/Models/{slope_scenario_table_params['modelId']}/ScenarioTables")
+        response = self.session.get(f"{self.api_url}/v1/Models/{slope_scenario_table_params['modelId']}/ScenarioTables")
         self.__check_response(response)
         # Get the list of scenario tables for the model
         scenario_tables = response.json()["items"]
         scenario_table_id = next(item for item in scenario_tables if item["name"] == slope_scenario_table_params["name"])["id"]
         logging.debug(f"Updating Scenario Table with parameters: {slope_scenario_table_params}")
-        response = self.session.patch(f"{self.api_url}/ScenarioTables/{scenario_table_id}", json=slope_scenario_table_params)
+        response = self.session.patch(f"{self.api_url}/v1/ScenarioTables/{scenario_table_id}", json=slope_scenario_table_params)
         self.__check_response(response)
         return response.json()["id"]
     
@@ -219,13 +220,13 @@ class SlopeApi:
             report_params["offset"] = offset
             
         logging.debug(f"Generating workbook report {workbook_id} with parameters: {report_params}")
-        response = self.session.post(f"{self.api_url}/Reports/Workbooks/{workbook_id}/Generate", json=report_params)
+        response = self.session.post(f"{self.api_url}/v1/Reports/Workbooks/{workbook_id}/Generate", json=report_params)
         self.__check_response(response)
         return response.json()
 
     def get_workbook_report_status(self, generation_id: str) -> dict:
         self.__keep_alive()
-        response = self.session.get(f"{self.api_url}/Reports/Workbooks/Status/{generation_id}")
+        response = self.session.get(f"{self.api_url}/v1/Reports/Workbooks/Status/{generation_id}")
         self.__check_response(response)
         return response.json()
     
@@ -280,7 +281,7 @@ class SlopeApi:
     def get_data_table_by_id(self, data_table_id: int) -> pd.DataFrame:
         self.__keep_alive()
         logging.debug(f"Retrieving contents of data table with ID '{data_table_id}'")
-        endpoint_url = f"{self.api_url}/DataTables/Data?DataTableId={data_table_id}"
+        endpoint_url = f"{self.api_url}/v1/DataTables/Data?DataTableId={data_table_id}"
         return self.__get_data_table(endpoint_url)
 
     # Download the contents of a data table with given Data Table Name, Version, and Table Structure ID
@@ -289,7 +290,7 @@ class SlopeApi:
         self.__keep_alive()
         version_name = version or "latest"
         logging.debug(f"Retrieving contents of data table with Name '{table_name}' Version '{version_name}' of Table Structure ID '{table_structure_id}'")
-        endpoint_url = f"{self.api_url}/DataTables/Data?Name={table_name}&TableStructureId={table_structure_id}"
+        endpoint_url = f"{self.api_url}/v1/DataTables/Data?Name={table_name}&TableStructureId={table_structure_id}"
         if version is not None:
             endpoint_url += f"&Version={version}"
 
@@ -349,10 +350,10 @@ class SlopeApi:
         self.__keep_alive()
         response = ""
         if fields is None:
-            response = self.session.get(f"{self.api_url}/Projections/{projection_id}")
+            response = self.session.get(f"{self.api_url}/v1/Projections/{projection_id}")
         else :
             csv_fields = ','.join(fields)
-            response = self.session.get(f"{self.api_url}/Projections/{projection_id}?fields={csv_fields}")
+            response = self.session.get(f"{self.api_url}/v1/Projections/{projection_id}?fields={csv_fields}")
         self.__check_response(response)
         return response.json()
 
@@ -363,7 +364,7 @@ class SlopeApi:
     def get_table_structure_columns(self, table_structure_id: int) -> list[dict]:
         self.__keep_alive()
         logging.debug(f"Retrieving Table Structure columns for ID {table_structure_id}")
-        response = self.session.get(f"{self.api_url}/TableStructures/{table_structure_id}/Columns")
+        response = self.session.get(f"{self.api_url}/v1/TableStructures/{table_structure_id}/Columns")
         self.__check_response(response)
         return response.json()["items"]
     
@@ -373,7 +374,7 @@ class SlopeApi:
     # False - The projection has completed (possibly unsuccessfully)
     def is_projection_running(self, projection_id) -> bool:
         self.__keep_alive()
-        response = self.session.get(f"{self.api_url}/Projections/{projection_id}")
+        response = self.session.get(f"{self.api_url}/v1/Projections/{projection_id}")
         if response.ok:
             return response.json()["isRunning"]
         else:
@@ -383,7 +384,7 @@ class SlopeApi:
     def list_data_tables(self, model_id: int) -> list[dict]:
         self.__keep_alive()
         logging.debug(f"Retrieving Data Table listing from model {model_id}")
-        response = self.session.get(f"{self.api_url}/DataTables/List?ModelId={model_id}")
+        response = self.session.get(f"{self.api_url}/v1/DataTables/List?ModelId={model_id}")
         self.__check_response(response)
         return response.json()
 
@@ -391,7 +392,7 @@ class SlopeApi:
     def list_data_tables_by_structure_name(self, model_id: int, table_structure_name: str) -> list[dict]:
         self.__keep_alive()
         logging.debug(f"Retrieving Data Table listing from model {model_id} with Table Structure name '{table_structure_name}'")
-        response = self.session.get(f"{self.api_url}/DataTables/List?ModelId={model_id}&TableStructureName={table_structure_name}")
+        response = self.session.get(f"{self.api_url}/v1/DataTables/List?ModelId={model_id}&TableStructureName={table_structure_name}")
         self.__check_response(response)
         return response.json()
 
@@ -400,7 +401,7 @@ class SlopeApi:
         self.__keep_alive()
         logging.debug(f"Retrieving Data Table listing from Table Structure {table_structure_id}")
         response = self.session.get(
-            f"{self.api_url}/DataTables/List?TableStructureId={table_structure_id}")
+            f"{self.api_url}/v1/DataTables/List?TableStructureId={table_structure_id}")
         self.__check_response(response)
         return response.json()
 
@@ -408,14 +409,14 @@ class SlopeApi:
     def list_decrement_tables(self, model_id: int) -> list[dict]:
         self.__keep_alive()
         logging.debug(f"Retrieving Data Table listing from model {model_id}")
-        response = self.session.get(f"{self.api_url}/DecrementTables/List?ModelId={model_id}")
+        response = self.session.get(f"{self.api_url}/v1/DecrementTables/List?ModelId={model_id}")
         self.__check_response(response)
         return response.json()
 
     def list_projection_templates(self, model_id: int) -> list[dict]:
         self.__keep_alive()
         logging.debug(f"Retrieving Projection Templates from model {model_id}")
-        url = f"{self.api_url}/Models/{model_id}/ProjectionTemplates"
+        url = f"{self.api_url}/v1/Models/{model_id}/ProjectionTemplates"
         response = self.session.get(url)
         self.__check_response(response)
         json = response.json()
@@ -437,14 +438,14 @@ class SlopeApi:
     def list_table_structures(self, model_id: int) -> list[dict]:
         self.__keep_alive()
         logging.debug(f"Retrieving all Table Structures from mode {model_id}")
-        response = self.session.get(f"{self.api_url}/TableStructures/List/{model_id}")
+        response = self.session.get(f"{self.api_url}/v1/TableStructures/List/{model_id}")
         self.__check_response(response)
         return response.json()
 
     # Run a projection
     def run_projection(self, projection_id):
         self.__keep_alive()
-        response = self.session.post(f"{self.api_url}/Projections/{projection_id}/run")
+        response = self.session.post(f"{self.api_url}/v1/Projections/{projection_id}/run")
         if not response.ok:
             raise Exception(f"Failed to start projection with id: {projection_id}", response.text)
         
@@ -452,7 +453,7 @@ class SlopeApi:
     def update_projection(self, projection_id, properties):
         self.__keep_alive()
         logging.debug(f"Updating Projection ID {projection_id} with parameters: {properties}")
-        response = self.session.patch(f"{self.api_url}/Projections/{projection_id}", json=properties)
+        response = self.session.patch(f"{self.api_url}/v1/Projections/{projection_id}", json=properties)
         self.__check_response(response)
 
     # Update the Model Point file on a projection
@@ -470,7 +471,7 @@ class SlopeApi:
             }]
         }
         logging.debug(f"Updating Projection ID {projection_id} with parameters: {projection_update_parameters}")
-        response = self.session.patch(f"{self.api_url}/Projections/{projection_id}", json=projection_update_parameters)
+        response = self.session.patch(f"{self.api_url}/v1/Projections/{projection_id}", json=projection_update_parameters)
         self.__check_response(response)
 
     # Update the data table being used on a projection
@@ -483,7 +484,7 @@ class SlopeApi:
             }]
         }
         logging.debug(f"Updating Projection ID {projection_id} with parameters: {projection_update_parameters}")
-        response = self.session.patch(f"{self.api_url}/Projections/{projection_id}", json=projection_update_parameters)
+        response = self.session.patch(f"{self.api_url}/v1/Projections/{projection_id}", json=projection_update_parameters)
         self.__check_response(response)
 
     # Wait until a projection has completed running. Periodically check for updates until is is finished.
@@ -492,3 +493,157 @@ class SlopeApi:
             status = self.get_projection_status(projection_id)
             logging.info(f"Waiting for Projection ID {projection_id} to finish. Current status: {status}")
             time.sleep(15)  # Check once every 15 seconds if it is done
+
+    # Internal function for retrieving every page of a paginated 'items'/'offset' endpoint
+    def __get_all_pages(self, url: str, params: dict = None) -> list[dict]:
+        params = dict(params or {})
+        items = []
+        while True:
+            response = self.session.get(url, params=params)
+            self.__check_response(response)
+            json = response.json()
+            items += json["items"]
+            if not json.get("offset"):
+                return items
+            params["Offset"] = json["offset"]
+
+    # Returns a list of all products defined on a given Model ID
+    def list_model_products(self, model_id: int) -> list[dict]:
+        self.__keep_alive()
+        logging.debug(f"Retrieving Products from model {model_id}")
+        return self.__get_all_pages(f"{self.api_url}/v1/Models/{model_id}/Products")
+
+    # Returns a list of all data tables on a given Model ID, optionally filtered to a Table Structure name
+    def list_model_data_tables(self, model_id: int, table_structure_name: str = None) -> list[dict]:
+        self.__keep_alive()
+        logging.debug(f"Retrieving Data Tables from model {model_id} with Table Structure name '{table_structure_name}'")
+        params = {"TableStructureName": table_structure_name} if table_structure_name else None
+        return self.__get_all_pages(f"{self.api_url}/v1/Models/{model_id}/DataTables", params)
+
+    # Returns the model point fields defined on a given (model) Product ID
+    def get_product_model_point_fields(self, product_id: int) -> list[dict]:
+        self.__keep_alive()
+        logging.debug(f"Retrieving Model Point Fields for product {product_id}")
+        return self.__get_all_pages(f"{self.api_url}/v1/Products/{product_id}/ModelPointFields")
+
+    # Returns the portfolios configured on a projection
+    def get_projection_portfolios(self, projection_id: int) -> list[dict]:
+        self.__keep_alive()
+        logging.debug(f"Retrieving Portfolios for projection {projection_id}")
+        return self.__get_all_pages(f"{self.api_url}/v1/Projections/{projection_id}/Portfolios")
+
+    # Returns the products configured on a projection's portfolio (portfolio ID is the ID on the projection)
+    def get_portfolio_products(self, portfolio_id: int) -> list[dict]:
+        self.__keep_alive()
+        logging.debug(f"Retrieving Products for projection portfolio {portfolio_id}")
+        return self.__get_all_pages(f"{self.api_url}/v1/Projections/Portfolios/{portfolio_id}/Products")
+
+    # Add a model product to a projection's portfolio. Returns the ID of the product on the projection
+    def add_product_to_portfolio(self, portfolio_id: int, product_id: int, name: str, model_point_file: dict = None) -> int:
+        self.__keep_alive()
+        params = {"productId": product_id, "name": name}
+        if model_point_file is not None:
+            params["modelPointFile"] = model_point_file
+        logging.debug(f"Adding product to projection portfolio {portfolio_id} with parameters: {params}")
+        response = self.session.post(f"{self.api_url}/v1/Projections/Portfolios/{portfolio_id}/Products", json=params)
+        self.__check_response(response)
+        return response.json()["id"]
+
+    # Remove a product from a projection's portfolio (product ID is the ID on the projection)
+    def remove_product_from_portfolio(self, product_id: int):
+        self.__keep_alive()
+        logging.debug(f"Removing product {product_id} from projection portfolio")
+        response = self.session.delete(f"{self.api_url}/v1/Projections/Portfolios/Products/{product_id}")
+        self.__check_response(response)
+
+    # Returns the latest version of files in the SLOPE File Manager, optionally filtered to a list of folders
+    def list_files(self, folders: list[str] = None) -> list[dict]:
+        self.__keep_alive()
+        params = {"Folders": ",".join(folders)} if folders else None
+        logging.debug(f"Retrieving file listing for folders: {folders}")
+        return self.__get_all_pages(f"{self.api_url}/v1/Files/GetFiles", params)
+
+    # Download the contents of a data table exactly as the API returns it (handles pagination)
+    # Returns {"columns": [...], "rows": [[...], ...]} with rows as positional string values, which can be passed back
+    # unchanged to create_data_table_from_rows / update_data_table_rows
+    def get_data_table_raw(self, data_table_id: int) -> dict:
+        self.__keep_alive()
+        logging.debug(f"Retrieving raw contents of data table with ID '{data_table_id}'")
+        url = f"{self.api_url}/v1/DataTables/Data"
+        params = {"DataTableId": data_table_id}
+        response = self.session.get(url, params=params)
+        self.__check_response(response)
+        json = response.json()
+        if 'rows' not in json:
+            raise ValueError(f"Data Table {data_table_id} is file only - row data is not available")
+        table = {"columns": json["columns"], "rows": json["rows"]}
+        while json.get("offset"):
+            params["Offset"] = json["offset"]
+            response = self.session.get(url, params=params)
+            self.__check_response(response)
+            json = response.json()
+            table["rows"] += json["rows"]
+        return table
+
+    # Create a new data table directly from row data (no file upload). Returns the new Data Table ID
+    def create_data_table_from_rows(self, table_structure_id: int, name: str, rows: list[list[str]]) -> int:
+        self.__keep_alive()
+        self.__check_row_limit(rows)
+        logging.debug(f"Creating Data Table '{name}' on Table Structure {table_structure_id} with {len(rows)} rows")
+        params = {"tableStructureId": table_structure_id, "name": name, "rows": rows}
+        response = self.session.post(f"{self.api_url}/v2/DataTables", json=params)
+        self.__check_response(response)
+        return response.json()["id"]
+
+    # Overwrite the rows of an existing data table directly from row data (no file upload)
+    # Returns the Data Table ID, which will differ from the one passed in if SLOPE versioned the table
+    def update_data_table_rows(self, data_table_id: int, rows: list[list[str]]) -> int:
+        self.__keep_alive()
+        self.__check_row_limit(rows)
+        logging.debug(f"Updating Data Table {data_table_id} with {len(rows)} rows")
+        response = self.session.put(f"{self.api_url}/v1/DataTables/{data_table_id}/Data", json={"rows": rows})
+        self.__check_response(response)
+        return response.json()["id"]
+
+    # If a data table with this name already exists on the model for the table structure, overwrite its rows
+    # Otherwise create a new data table from the rows. Returns the Data Table ID
+    def upsert_data_table_rows(self, model_id: int, table_structure_id: int, table_structure_name: str, name: str, rows: list[list[str]]) -> int:
+        existing = self.list_model_data_tables(model_id, table_structure_name)
+        data_table_id = next((table["id"] for table in existing
+                              if table["name"] == name and table.get("isLatestVersion", True)), None)
+        if data_table_id is None:
+            return self.create_data_table_from_rows(table_structure_id, name, rows)
+        return self.update_data_table_rows(data_table_id, rows)
+
+    @staticmethod
+    def __check_row_limit(rows: list):
+        if len(rows) == 0:
+            raise ValueError("Data table row data must contain at least 1 row")
+        if len(rows) > SlopeApi.max_data_table_rows:
+            raise ValueError(f"Data table row data has {len(rows)} rows - the API limit is {SlopeApi.max_data_table_rows}. "
+                             "Use the file-based table upload for larger tables.")
+
+    # Convert a DataFrame into positional row data for the data table row endpoints
+    # columns is the result of get_table_structure_columns. Values are ordered with index columns first, then data
+    # columns, each by sortOrder. Columns missing from the DataFrame and NaN/None values are passed as empty strings
+    @staticmethod
+    def dataframe_to_rows(df: pd.DataFrame, columns: list[dict]) -> list[list[str]]:
+        ordered = sorted(columns, key=lambda col: (not col["isIndex"], col["sortOrder"]))
+        for col in ordered:
+            if col["dataType"] == "MortalityTable":
+                raise ValueError(f"Column '{col['name']}' is a MortalityTable column, which is not supported by dataframe_to_rows")
+
+        def to_str(value, data_type: str) -> str:
+            if value is None or (not isinstance(value, str) and pd.isna(value)):
+                return ""
+            if data_type == "Boolean":
+                return "true" if str(value).lower() in ("true", "1", "1.0") else "false"
+            if data_type == "Integer" and isinstance(value, float) and value.is_integer():
+                return str(int(value))
+            return str(value)
+
+        rows = []
+        for _, record in df.iterrows():
+            rows.append([to_str(record[col["name"]], col["dataType"]) if col["name"] in df.columns else ""
+                         for col in ordered])
+        return rows
