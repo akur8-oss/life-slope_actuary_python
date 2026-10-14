@@ -32,6 +32,8 @@ class SbaSolver:
     STARTING_ASSET_COLUMNS = ["Scaling Target", "Scenario #", "Scaling Factor"]
     # Columns returned by the Liability Cash Flows report. Time Index is only used to find the last cash flow time
     EPL_REPORT_COLUMNS = ["Time Index", "Date", "Cash Flow"]
+    # Number of scenario rows written to the starting assets table for each guess
+    SCALING_TABLE_ROWS = 10
 
     @dataclass
     class TimeSolveParams:
@@ -522,7 +524,9 @@ class SbaSolver:
         scenario_table_id = self.api.create_or_update_scenario_table(scenario_file, scenario_params)
         return scenario_table_id
 
-    def __get_solver_results(self, projection_id, guesses) -> tuple[int, float]:
+    # Wait for a solver projection to finish and add its results to guesses: a list of points
+    # {"value": starting assets, "result": ending assets, "projectionId"} for each scenario
+    def __get_solver_results(self, projection_id, guesses: dict[int, list[dict]]):
         # Wait for projection to finish
         while self.api.is_projection_running(projection_id):
             status = self.api.get_projection_status(projection_id)
@@ -543,30 +547,14 @@ class SbaSolver:
                 if (len(sba_result) >= 9):
                     break
 
-        result = {
-            "bel": 0,
-            "tolerance": 0,
-            "projectionId": projection_id,
-            "scenario": 0,
-        }
-        # Save results in array for solver
-        for idx, row in sba_result.iterrows():
+        logging.info(f"Solver results for projection {projection_id}:\n"
+                     f"{sba_result[['Scenario Number', 'Starting Assets', 'Ending Assets']].to_string(index=False)}")
+
+        # Save results for each scenario for the solver
+        for _, row in sba_result.iterrows():
             scenario = int(row['Scenario Number'])
-            start = row['Starting Assets']
-            end = row['Ending Assets']
-
-            if abs(end) > result["tolerance"]:
-                result["tolerance"] = abs(end)
-
-            if start > result["bel"]:
-                result["bel"] = start
-                result["scenario"] = scenario
-
-            if scenario not in guesses:
-                guesses[scenario] = []
-            guesses[scenario].append({"value": start, "result": end})
-
-        return result
+            guesses.setdefault(scenario, []).append({"value": row['Starting Assets'], "result": row['Ending Assets'],
+                                                     "projectionId": projection_id})
 
 
     def __solve_at_time(self, params: TimeSolveParams) -> dict:
@@ -629,79 +617,89 @@ class SbaSolver:
             }]
 
         # Start Initial Guesses for solver - use the initial guess if one was provided, otherwise derive it
+        # A provided guess should be close to the answer, so it is bracketed tightly. A derived guess is likely to be
+        # further off, so it is bracketed more widely
         if params.initial_guess is not None:
             starting_guess = params.initial_guess
-            logging.info(f"Using provided initial guess of {starting_guess:,.2f}")
+            brackets = settings.provided_guess_brackets
+            logging.info(f"Using provided initial guess of {starting_guess:,.2f} with brackets {brackets}")
         else:
             starting_guess = market_value_liabilities if market_value_liabilities > 0 else self.__asset_market_value
             if starting_guess <= 0:
                 starting_guess = 10000000  # If both MVL and Asset MV are 0 or negative, just start at 10 million
-            logging.info(f"Using derived initial guess of {starting_guess:,.2f}")
+            brackets = settings.derived_guess_brackets
+            logging.info(f"Using derived initial guess of {starting_guess:,.2f} with brackets {brackets}")
         solver_projections = []
         guess_num = 1
 
-        # Low - 90% of starting guess
-        starting_assets = [starting_guess * 0.99] * 10
-        solver_projections.append(self.__start_run(starting_assets, params.time_index, solver_projection_parameters, guess_num, params.use_epl))
-        guess_num += 1
-        # Mid - 99.5% of starting guess
-        starting_assets = [starting_guess * 0.995] * 10
-        solver_projections.append(self.__start_run(starting_assets, params.time_index, solver_projection_parameters, guess_num, params.use_epl))
-        guess_num += 1
-        # High - 110% of MVL
-        starting_assets = [starting_guess * 1.01] * 10
-        solver_projections.append(self.__start_run(starting_assets, params.time_index, solver_projection_parameters, guess_num, params.use_epl))
-        guess_num += 1
+        # First round - run the low, mid and high multiples of the starting guess
+        for bracket in brackets:
+            starting_assets = [starting_guess * bracket] * SbaSolver.SCALING_TABLE_ROWS
+            solver_projections.append(self.__start_run(starting_assets, params.time_index, solver_projection_parameters, guess_num, params.use_epl))
+            guess_num += 1
 
-        # Iteration
-        best_guess = {
-            "bel": market_value_liabilities,
-            "tolerance": market_value_liabilities,
-            "projectionId": 0,
-            "scenario": 0
-        }
-
-        guesses = {}
-        for i in range(1, 9):
-            guesses[i] = []
-
+        # Iteration - each round runs the low, mid and high guesses at the same time. After each run, check whether the
+        # BEL has converged using every result so far
+        guesses: dict[int, list[dict]] = {}
+        states = {}
         for i in range(self.__max_iterations):
             for projection_id in solver_projections:
-                this_guess = self.__get_solver_results(projection_id, guesses)
-                # if within tolerance, stop here
-                if this_guess["tolerance"] <= self.__tolerance:
-                    return this_guess
-                if this_guess["tolerance"] < best_guess["tolerance"]:
-                    best_guess = this_guess
+                self.__get_solver_results(projection_id, guesses)
+                converged = self.__check_convergence(guesses)
+                if converged is not None:
+                    logging.info(f"BEL converged at {converged['bel']:,.2f} in scenario {converged['scenario']} "
+                                 f"(projection {converged['projectionId']}, ending assets {converged['endingAssets']:,.2f})")
+                    return converged
 
+            # Not converged - work out the next round of guesses for each scenario
+            next_guesses, states = self.__solve_next_guess(guesses, starting_guess)
+            self.__log_solver_state(i + 1, states)
 
-            # if outside tolerance and not at max iterations, create next set of guesses and iterate again
+            # if not at max iterations, run the next round of guesses
             if i < self.__max_iterations - 1:
                 solver_projections = []
-                for guess in self.__solve_next_guess(guesses):
+                for guess in next_guesses:
                     solver_projections.append(self.__start_run(guess, params.time_index, solver_projection_parameters, guess_num, params.use_epl))
                     guess_num += 1
 
-        self.__calculate_max_error(guesses, best_guess['scenario'])
-        logging.info(f"No projection within tolerance after {self.__max_iterations}.")
-        logging.info(f"Best guess of {best_guess['bel']} with final difference of {best_guess['tolerance']}.")
+        # Not converged - use the closest result for the scenario with the highest estimated BEL
+        binding = max(states, key=lambda scenario: states[scenario]["estimate"])
+        best_point = min(guesses[binding], key=lambda point: abs(point["result"]))
+        state = states[binding]
+        self.max_error = "Unknown" if state["lower"] is None else str((state["upper"] - state["lower"]) / 2)
+        logging.info(f"No projection within tolerance after {self.__max_iterations} iterations.")
+        logging.info(f"Best guess of {best_point['value']:,.2f} in scenario {binding} with final difference of {abs(best_point['result']):,.2f}.")
         logging.info(f"Maximum Potential Error in BEL: {self.max_error}")
-        return best_guess
+        return self.__solver_result(binding, best_point)
 
-    def __calculate_max_error(self, prior_results: dict[int, float], scenario: int):
-        guesses = prior_results[scenario]
+    # Returns the solver result for a scenario's point
+    @staticmethod
+    def __solver_result(scenario: int, point: dict) -> dict:
+        return {"bel": point["value"], "tolerance": abs(point["result"]), "endingAssets": point["result"],
+                "projectionId": point["projectionId"], "scenario": scenario}
 
-        # Find the 2 closest points to 0
-        guesses.sort(key=lambda x: x['result'])
-        index_low = next((i for i, x in reversed(list(enumerate(guesses))) if x['result'] < 0), None)
-        index_high = next((i for i, x in enumerate(guesses) if x['result'] >= 0), None)
-        
+    # The BEL has converged when the scenario with the highest converged starting assets is within tolerance, and every
+    # other scenario has a result at or below that starting value that is either within tolerance or has ending assets
+    # >= 0 (so it needs fewer assets and doesn't set the BEL). Returns the solver result, or None if not converged
+    def __check_convergence(self, guesses: dict[int, list[dict]]) -> dict | None:
+        converged = {}
+        for scenario, points in guesses.items():
+            within = [point for point in points if abs(point["result"]) <= self.__tolerance]
+            if within:
+                converged[scenario] = min(within, key=lambda point: abs(point["result"]))
+        if not converged:
+            return None
 
-        if index_low is None or index_high is None:
-            self.max_error = "Unknown"
-            return
-        
-        self.max_error = str(abs(guesses[index_high]['value'] - guesses[index_low]['value'])/2)
+        binding = max(converged, key=lambda scenario: converged[scenario]["value"])
+        bel = converged[binding]["value"]
+        for scenario, points in guesses.items():
+            if scenario == binding:
+                continue
+            if not any(point["value"] <= bel and (point["result"] >= 0 or abs(point["result"]) <= self.__tolerance)
+                       for point in points):
+                return None
+
+        return self.__solver_result(binding, converged[binding])
 
     def __start_run(self, starting_assets: list[float], time_index, projection_params, guess_num: int, use_epl: bool) -> int:
         # Write new starting asset values to a table
@@ -741,43 +739,97 @@ class SbaSolver:
         self.api.run_projection(projection_id)
         return projection_id
 
-    def __solve_next_guess(self, prior_results: dict[int, float]):
-        max_scenario = max(prior_results.keys())
-        low = [0] * (max_scenario+1)
-        mid = [0] * (max_scenario+1)
-        high = [0] * (max_scenario+1)
-        for scenario, guesses in prior_results.items():
-            size = len(guesses)
-            # Perform an iterative solve from the closest two points for each scenario
-            if len(guesses) < 2:
-                print("Must have at least 2 values to perform interpolation")
-                return 0
+    # Returns the next round of guesses as [low, mid, high] lists of starting assets indexed by scenario, plus the solver
+    # state of each scenario. Scenarios without results keep the default guess
+    def __solve_next_guess(self, prior_results: dict[int, list[dict]], default_guess: float) -> tuple[list[list[float]], dict[int, dict]]:
+        size = max(SbaSolver.SCALING_TABLE_ROWS, max(prior_results, default=-1) + 1)
+        next_guesses = [[default_guess] * size for _ in range(3)]
+        states = {}
+        for scenario, points in prior_results.items():
+            states[scenario] = self.__next_scenario_guesses(points)
+            for k in range(3):
+                next_guesses[k][scenario] = states[scenario]["guesses"][k]
+        return next_guesses, states
 
-            # Find the 2 closest points to 0
-            guesses.sort(key=lambda x: x['result'])
-            index_low = next((i for i, x in reversed(list(enumerate(guesses))) if x['result'] < 0), None)
-            index_high = next((i for i, x in enumerate(guesses) if x['result'] >= 0), None)
+    # Work out the next 3 guesses for a scenario from all of its results so far. The mid guess is the best estimate of the
+    # starting assets that give 0 ending assets. The low and high guesses are placed either side of it by how uncertain
+    # that estimate is, so that the next round is likely to bracket the answer closely
+    def __next_scenario_guesses(self, points: list[dict]) -> dict:
+        below = [point for point in points if point["result"] < 0]
+        above = [point for point in points if point["result"] >= 0]
+        best = min(points, key=lambda point: abs(point["result"]))
+        state = {"runs": len(points), "best": best, "lower": None, "upper": None}
 
-            if index_low is None:
-                # There are no points <0, so find the next lowest positive point closest to 0
-                index_low = index_high
-                index_high = next((i for i, x in enumerate(guesses) if x['result'] > guesses[index_low]['result']), None)
-            elif index_high is None:
-                # There are not any points >0, so find the next highest point negative value closest to 0
-                index_high = index_low
-                index_low = next((i for i, x in reversed(list(enumerate(guesses))) if x['result'] < guesses[index_high]['result']), None)
+        if below and above:
+            # Bracketed - the answer lies between the closest results either side of 0
+            low = max(below, key=lambda point: point["result"])
+            high = min(above, key=lambda point: point["result"])
+            lower, upper = sorted((low["value"], high["value"]))
+            state.update(lower=lower, upper=upper)
+            slope = (high["result"] - low["result"]) / (high["value"] - low["value"]) if high["value"] != low["value"] else 0
+            if slope <= 0:
+                # Ending assets don't increase with starting assets across the bracket - split the bracket instead
+                estimate, spread, method = (lower + upper) / 2, (upper - lower) / 4, "bisection"
+            else:
+                # Secant estimate, improved with inverse quadratic interpolation through a third result if it stays
+                # inside the bracket. The difference between the two estimates measures how uncertain the estimate is
+                estimate = high["value"] - high["result"] / slope
+                spread, method = (upper - lower) / 4, "secant"
+                third = next((point for point in sorted(points, key=lambda point: abs(point["result"]))
+                              if point["result"] not in (low["result"], high["result"])), None)
+                if third is not None:
+                    quadratic = SbaSolver.__inverse_quadratic(low, high, third)
+                    if lower < quadratic < upper:
+                        spread = abs(quadratic - estimate)
+                        estimate, method = quadratic, "inverse quadratic"
+                # Space the guesses at least the starting assets equivalent of the tolerance apart
+                spread = max(spread, self.__tolerance / slope)
+            # Keep the low and high guesses inside the bracket
+            guesses = [max(estimate - spread, (lower + estimate) / 2), estimate, min(estimate + spread, (estimate + upper) / 2)]
+        else:
+            # Not bracketed - extrapolate from the 2 results closest to 0, limited to 4 times the range tried so far
+            other = next((point for point in sorted(points, key=lambda point: abs(point["result"]))
+                          if point["value"] != best["value"]), None)
+            slope = (best["result"] - other["result"]) / (best["value"] - other["value"]) if other else 0
+            if slope <= 0:
+                # No usable slope - step 1% towards 0 ending assets
+                step, method = (1 if best["result"] < 0 else -1) * abs(best["value"]) * 0.01, "step"
+                spread = abs(step) / 4
+            else:
+                step = -best["result"] / slope
+                values = [point["value"] for point in points]
+                max_step = 4 * (max(values) - min(values))
+                step, method = max(-max_step, min(max_step, step)), "extrapolation"
+                spread = max(abs(step) / 4, self.__tolerance / slope)
+            estimate = best["value"] + step
+            guesses = [estimate - spread, estimate, estimate + spread]
 
-            # Secant method to calculate best guess of starting asset that will result in 0 at end
-            solved_guess = guesses[index_high]['value'] \
-                - guesses[index_high]['result'] * (guesses[index_high]['value'] - guesses[index_low]['value']) \
-                / (guesses[index_high]['result'] - guesses[index_low]['result'])
+        state.update(estimate=estimate, method=method, guesses=guesses)
+        return state
 
-            # Calculate a range of guesses around the best guess to try using a weighted average within the interval
-            low[scenario] = solved_guess * (1 - settings.next_guess_range) + guesses[index_low]['value'] * settings.next_guess_range
-            mid[scenario] = solved_guess
-            high[scenario] = solved_guess * (1 - settings.next_guess_range) + guesses[index_high]['value'] * settings.next_guess_range
+    # Inverse quadratic interpolation through 3 results: the starting assets estimated to give 0 ending assets
+    @staticmethod
+    def __inverse_quadratic(p0: dict, p1: dict, p2: dict) -> float:
+        x0, x1, x2 = p0["value"], p1["value"], p2["value"]
+        f0, f1, f2 = p0["result"], p1["result"], p2["result"]
+        return (x0 * f1 * f2 / ((f0 - f1) * (f0 - f2))
+                + x1 * f0 * f2 / ((f1 - f0) * (f1 - f2))
+                + x2 * f0 * f1 / ((f2 - f0) * (f2 - f1)))
 
-        # Returns the best guess plus a range around that best guess within the interval
-        return [low, mid, high]
-
-
+    # Log the state of each scenario after a round of guesses
+    @staticmethod
+    def __log_solver_state(iteration: int, states: dict[int, dict]):
+        rows = [{"Scenario": scenario,
+                 "Runs": state["runs"],
+                 "Best Start": state["best"]["value"],
+                 "Best End": state["best"]["result"],
+                 "Bracket Low": state["lower"],
+                 "Bracket High": state["upper"],
+                 "Method": state["method"],
+                 "Next Low": state["guesses"][0],
+                 "Next Mid": state["guesses"][1],
+                 "Next High": state["guesses"][2]}
+                for scenario, state in sorted(states.items())]
+        binding = max(states, key=lambda scenario: states[scenario]["estimate"])
+        logging.info(f"Solver state after round {iteration} - highest estimated BEL is scenario {binding} at "
+                     f"{states[binding]['estimate']:,.2f}:\n{pd.DataFrame(rows).to_string(index=False)}")

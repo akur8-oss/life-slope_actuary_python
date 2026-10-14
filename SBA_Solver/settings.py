@@ -49,5 +49,9 @@ shared_solver_tables = {
 }
 
 solver_final_asset_tolerance = 100000       # tolerance for remaining assets for the BEL solve - Higher tolerances will converge faster
+# Multiples of the starting guess run in the first round of guesses: tight around a guess provided in main.py, wider
+# around a guess derived from the market value of liabilities (or asset market value), which is likely further off
+provided_guess_brackets = [0.98, 1.00, 1.02]
+derived_guess_brackets = [0.90, 0.995, 1.05]
+
 solver_max_iterations = 5                   # The maximum number of attempts to solve for BEL. If max iterations is exceeded, the last closes guess outside the tolerance will be used
-next_guess_range = 0.10                     # Check a 10% weighted average range around the last guess

@@ -10,21 +10,75 @@ from requests.adapters import HTTPAdapter
 from urllib3 import Retry
 
 
+# Retry policy for every SLOPE API call, logging each retry so intermittent failures are visible in the run log
+class _LoggedRetry(Retry):
+    def increment(self, method=None, url=None, response=None, error=None, _pool=None, _stacktrace=None):
+        reason = f"HTTP {response.status}" if response is not None and response.status else repr(error)
+        new_retry = super().increment(method, url, response, error, _pool, _stacktrace)
+        logging.warning(f"SLOPE API {method} {url} failed ({reason}) - retry {len(new_retry.history)} of {SlopeApi.max_retries}")
+        return new_retry
+
+
+# Adds a default timeout to every request, so a hung connection fails and is retried instead of waiting forever
+class _TimeoutHTTPAdapter(HTTPAdapter):
+    def __init__(self, timeout, *args, **kwargs):
+        self.timeout = timeout
+        super().__init__(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = self.timeout
+        return super().send(request, **kwargs)
+
+
 class SlopeApi:
     api_url = "https://api.slopesoftware.com/api"
     max_data_table_rows = 100000  # API limit for row data table endpoints (also limited to 10MB per request)
+    # Retries for intermittent failures: connection errors, timeouts and these HTTP statuses, on every method
+    max_retries = 5
+    retry_backoff_factor = 2           # Wait 2, 4, 8, 16, 32 seconds between retries (or the server's Retry-After)
+    retry_statuses = [429, 500, 502, 503, 504]
+    # (connect, read) timeouts in seconds. SLOPE API calls time out at 30 seconds on the server, so the read timeout is
+    # just above that to let the server's 504 arrive first. File uploads/downloads go to pre-signed storage URLs instead
+    # and can take longer for large files
+    request_timeout = (10, 35)
+    file_transfer_timeout = (10, 300)
     __expires: datetime.datetime
     __refresh_token = ""
     __lock = threading.Lock()
 
     def __init__(self):
-        self.session = requests.Session()
-        retry = Retry(connect=3,
-                      backoff_factor=1,
-                      status_forcelist=[429, 500, 502, 503, 504])
-        adapter = HTTPAdapter(max_retries=retry)
-        self.session.mount('https://', adapter)
+        self.session = self.__create_session(SlopeApi.request_timeout)
         self.session.headers.update({"Content-type": "application/json"})
+        # Session without the SLOPE auth headers, for token refresh and the pre-signed file upload/download URLs
+        self.__external_session = self.__create_session(SlopeApi.file_transfer_timeout)
+        # Session for calls that must not be repeated if SLOPE may have received them (starting a projection). It only
+        # retries connection failures, where the request never reached SLOPE. Used with the main session's auth headers
+        self.__no_resend_session = self.__create_session(SlopeApi.request_timeout, resend=False)
+
+    # Returns a session that retries intermittent failures on every method, including POST and PATCH (e.g. report
+    # generation), and times out hung requests. Once the retries are used up, the last response is returned so the
+    # error is logged and raised by __check_response as before
+    # With resend=False, only connection failures are retried - not timeouts, dropped connections or error statuses,
+    # where SLOPE may already have acted on the request
+    @staticmethod
+    def __create_session(timeout: tuple[float, float], resend: bool = True) -> requests.Session:
+        if resend:
+            retry = _LoggedRetry(total=SlopeApi.max_retries,
+                                 backoff_factor=SlopeApi.retry_backoff_factor,
+                                 status_forcelist=SlopeApi.retry_statuses,
+                                 allowed_methods=None,
+                                 raise_on_status=False)
+        else:
+            retry = _LoggedRetry(total=SlopeApi.max_retries, connect=SlopeApi.max_retries, read=0, status=0, other=0,
+                                 backoff_factor=SlopeApi.retry_backoff_factor,
+                                 allowed_methods=None,
+                                 raise_on_status=False)
+        session = requests.Session()
+        adapter = _TimeoutHTTPAdapter(timeout, max_retries=retry)
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        return session
 
     @staticmethod
     def __check_response(response):
@@ -63,7 +117,7 @@ class SlopeApi:
         refresh_params = {
             "refreshToken": self.__refresh_token
         }
-        response = requests.post(f"{self.api_url}/v1/Authorize/Refresh", json=refresh_params, headers={"Content-Type": "application/json"})
+        response = self.__external_session.post(f"{self.api_url}/v1/Authorize/Refresh", json=refresh_params, headers={"Content-Type": "application/json"})
         self.__check_response(response)
         access_token = response.json()["accessToken"]
         self.session.headers.update({"Authorization": f"Bearer {access_token}"})
@@ -93,7 +147,9 @@ class SlopeApi:
         # Calculate the MD5 digest of the file - We will pass this AWS to verify integrity of file upload process
         md5_digest = self.__file_md5_digest(filename)
         # Note - Do not use session here - this is a direct call to s3 and does not use the Slope session auth
-        response = requests.put(upload_url, data=open(filename, "rb"))
+        # The file is read into memory so a retry re-sends the whole file
+        with open(filename, "rb") as file:
+            response = self.__external_session.put(upload_url, data=file.read())
         self.__check_response(response)
 
         response = self.session.post(f"{self.api_url}/v1/Files/SaveUpload", json=slope_file_params)
@@ -256,7 +312,7 @@ class SlopeApi:
                 raise TimeoutError(f"Report generation did not complete within {timeout} seconds.")
             time.sleep(5)
         logging.debug(f"Downloading report from {download_url}")
-        file_response = requests.get(download_url)
+        file_response = self.__external_session.get(download_url)
         self.__check_response(file_response)
         
         logging.debug(f"Saving as '{filename}'.")
@@ -445,7 +501,9 @@ class SlopeApi:
     # Run a projection
     def run_projection(self, projection_id):
         self.__keep_alive()
-        response = self.session.post(f"{self.api_url}/v1/Projections/{projection_id}/run")
+        # Not retried once sent - a repeated start of a projection that already started would fail
+        response = self.__no_resend_session.post(f"{self.api_url}/v1/Projections/{projection_id}/run",
+                                                 headers=self.session.headers)
         if not response.ok:
             raise Exception(f"Failed to start projection with id: {projection_id}", response.text)
         

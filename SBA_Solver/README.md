@@ -158,7 +158,9 @@ table before it is started.
   - A dict keyed by time point, e.g. `{0: 1500000000, 12: 1450000000}`: time points not
     in the dict derive their own guess.
 
-  Either way, the first three runs bracket the guess at 95%, 99.5% and 110%. A guess
+  A provided guess is bracketed tightly in the first round (`provided_guess_brackets`,
+  default 98%, 100%, 102%). A derived guess is likely to be further off, so it is
+  bracketed more widely (`derived_guess_brackets`, default 90%, 99.5%, 105%). A guess
   close to the answer (e.g. the BEL from a previous solve) usually converges in fewer
   iterations. The log shows whether each time point used a provided or derived guess.
 - `logging_level` — set inside `setup_logging()` in `main.py` (currently hardcoded
@@ -191,10 +193,13 @@ table before it is started.
   it in SLOPE.
 - `solver_final_asset_tolerance` — convergence tolerance on ending assets; higher
   values converge faster but less precisely.
+- `provided_guess_brackets` / `derived_guess_brackets` — the multiples of the starting
+  guess run in the first round. `provided_guess_brackets` (default `[0.98, 1.00, 1.02]`)
+  applies when `initial_guess` is given in `main.py`. `derived_guess_brackets` (default
+  `[0.90, 0.995, 1.05]`) applies when the guess is derived from the market value of
+  liabilities or asset market value.
 - `solver_max_iterations` — max number of iteration rounds before giving up and
   returning the best guess found so far.
-- `next_guess_range` — the weighted-average range (default 0.20 = 20%) around the
-  secant method's best guess used to bracket the next round of trial runs.
 
 ### One-time SLOPE-side setup
 No projection template is needed. The model used by the base projection must have:
@@ -277,16 +282,42 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
      - Looks up market value of liabilities at that point.
      - Generates a scenario file and asset MPFs at the pivot point (time 0 reuses the
        base projection's own asset model points).
-     - Brackets three initial starting-asset guesses (95%, 99.5%, 110% of the
-       starting guess: `initial_guess` if provided for this time point, otherwise the
-       market value of liabilities). For each one it writes the guess to a starting-assets data table,
+     - Brackets three initial starting-asset guesses around the starting guess:
+       `initial_guess` if provided for this time point, at `provided_guess_brackets`
+       (98%, 100%, 102%). Otherwise, the market value of liabilities at
+       `derived_guess_brackets` (90%, 99.5%, 105%). For each one it writes the guess to a starting-assets data table,
        creates a solver projection, applies the pivot-point settings, and runs it. The very
        first solver projection is a copy of the base projection set up for the solver
        (`__setup_first_solver_projection`); every later one is a copy of that first one.
-     - Iterates: checks each result against `solver_final_asset_tolerance`; if not
-       converged and iterations remain, computes a new bracket of guesses via the
-       secant method (`__solve_next_guess`) and reruns, up to
-       `solver_max_iterations`.
+     - Iterates in rounds of three runs, started together, up to `solver_max_iterations`
+       rounds. Each scenario has its own starting assets in every run, so each scenario
+       is solved separately using every result so far.
+       - **Convergence** (`__check_convergence`), checked after each run: the BEL has
+         converged when the scenario with the highest starting assets within
+         `solver_final_asset_tolerance` of 0 ending assets is found. Every other scenario
+         must have a result at or below that starting value with ending assets ≥ 0, or
+         within tolerance. Those scenarios need fewer assets and don't set the BEL, so
+         they don't need to be solved exactly. This assumes ending assets increase with
+         starting assets.
+       - **Next guesses** (`__solve_next_guess`), for each scenario:
+         - If results on both sides of 0 bracket the answer, the mid guess is an inverse
+           quadratic interpolation through the closest results. If that falls outside
+           the bracket, it uses the secant through the bracket ends instead, and if
+           ending assets don't rise across the bracket it bisects it.
+         - Otherwise, the mid guess extrapolates the secant through the two results
+           closest to 0, limited to 4 times the range tried so far.
+         - The low and high guesses sit either side of the mid guess, spaced by how
+           uncertain the estimate is: the gap between the quadratic and secant estimates,
+           and never less than the starting-asset equivalent of the tolerance. They are
+           kept inside the bracket, so each round is likely to leave a narrow bracket
+           around the answer.
+       - **Logging**: each run's results (scenario, starting and ending assets) are
+         logged. After each round, a table of every scenario's best result, bracket,
+         method and next guesses is logged, along with the scenario with the highest
+         estimated BEL.
+       - If it hasn't converged after `solver_max_iterations` rounds, it returns the
+         closest result for the scenario with the highest estimated BEL, and logs the
+         maximum potential error (half the width of that scenario's bracket).
 4. `print_results()` prints the collected BEL per time point to console.
 
 ## 6. API Integration Points
@@ -340,9 +371,32 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
   restart/checkpoint context, and any projections/tables already created in SLOPE
   will remain there.
 - When convergence isn't reached within `solver_max_iterations`, an estimate of
-  maximum potential BEL error is computed (`__calculate_max_error`) but only
+  maximum potential BEL error is computed but only
   surfaced via a log message — it is not included in `final_bel` or
   `print_results()` output.
+- **Automatic retries for intermittent API failures** (`Shared/slope_api.py`, used by both
+  solvers):
+  - **What is retried:** every SLOPE API call, on every method including POST and PATCH.
+    This includes the token refresh and the pre-signed file upload and download calls.
+  - **When:** connection errors, timeouts, and HTTP `429`, `500`, `502`, `503` and `504`
+    (e.g. a gateway timeout on report generation).
+  - **How often:** up to 5 times, waiting 2, 4, 8, 16 and 32 seconds, or the server's
+    `Retry-After` value.
+  - **Timeout:** SLOPE API calls time out after 10 seconds to connect or 35 seconds waiting
+    for a response. That is just above SLOPE's own 30-second limit, so a hung connection is
+    retried instead of waiting forever. Pre-signed file uploads and downloads go to file
+    storage rather than the SLOPE API, so they wait up to 300 seconds for large files.
+  - **Starting a projection is never sent twice:** it is retried only when the connection
+    fails before the request reaches SLOPE. After a timeout or an error status, SLOPE may
+    already have started the projection, so the error is raised instead.
+  - **Logging:** each retry is logged as a warning. If every retry fails, the error is
+    logged and raised as before.
+  - **Tuning:** `max_retries`, `retry_backoff_factor`, `retry_statuses`,
+    `request_timeout` and `file_transfer_timeout` on `SlopeApi`.
+  - **Caveat:** a retried POST, such as copying a projection or creating a data table, can
+    occasionally run twice if SLOPE completed the first request but the response was lost.
+    For example, you might see an extra copied projection in the solver folder. The solver
+    always uses the result of the request that succeeded.
 - Logging defaults to `INFO`; raise to `DEBUG` in `setup_logging()` for more detail
   on API calls and iteration progress. API credentials are never logged.
 
@@ -353,8 +407,8 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
   `virtual_folder_name`, `epl_product_name`, `epl_liability_id_field`, or the keys and
   column names in `solver_table_overrides` in `settings.py` to match.
 - **Convergence speed/precision trade-offs**: tune
-  `solver_final_asset_tolerance`, `solver_max_iterations`, and
-  `next_guess_range` in `settings.py`.
+  `solver_final_asset_tolerance` and `solver_max_iterations` in `settings.py`, or pass
+  an `initial_guess` in `main.py`.
 - **Credentials**: each user/environment needs their own local `.env` file in the repo
   root with `SLOPE_API_KEY`/`SLOPE_API_SECRET`; never commit this file.
 
@@ -403,7 +457,6 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
 - Exception handling in `calculate_bel()` is currently disabled (commented out).
 - The first solver projection is rebuilt from the base projection on every
   `calculate_bel` run.
-- Guess-bracket percentages (95% / 99.5% / 110%) and the fallback $10,000,000
-  starting guess (used when no `initial_guess` is provided and market value of
-  liabilities and asset market value are both zero or negative) are hardcoded in `sba_solver.py` rather than exposed
-  as configurable settings.
+- The fallback $10,000,000 starting guess (used when no `initial_guess` is provided and
+  market value of liabilities and asset market value are both zero or negative) is
+  hardcoded in `sba_solver.py` rather than exposed as a configurable setting.
