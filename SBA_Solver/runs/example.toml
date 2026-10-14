@@ -1,0 +1,48 @@
+# SBA solver run file
+#
+# To set up a run:
+#   1. Copy this file in the runs folder, e.g. to runs/run.toml (the default) or runs/2026Q3_base.toml.
+#      Only this example is committed - your own run files are git-ignored.
+#   2. Edit the values below.
+#   3. Run it from the SBA_Solver folder:
+#        uv run python main.py                          (uses runs/run.toml)
+#        uv run python main.py runs/2026Q3_base.toml
+#      or use the "SBA Solver Module" debug configuration in VS Code, which asks for the run file.
+#
+# The run file is checked before anything is sent to SLOPE, and every problem is reported at once.
+# Settings that rarely change (table names, EPL product, table overrides) are in settings.py.
+
+# Optional. Written to the log and the results file to help identify the run later
+description = "Example run"
+
+# The ID of the completed base projection to solve against
+base_projection_id = 200794
+
+# The pivot points, in months, at which to solve for BEL
+time_points = [0]
+# time_points = [0, 12, 24, 36, 48, 60, 120, 240]
+
+# Optional starting-asset guess for the solver, instead of deriving one from the market value of liabilities.
+# Leave it out to derive the guess at every time point. A guess close to the answer (e.g. the BEL from a previous
+# solve) converges in fewer iterations. Either a single value for every time point:
+#   initial_guess = 2684364663
+# or a section with a value for every time point ("all") and/or values for specific time points, which override "all".
+# Time points without a guess derive their own:
+#   [initial_guess]
+#   all = 2684364663
+#   "12" = 2650000000
+
+# Time 0 always uses the base projection's asset model points. Other time points always build their own asset model
+# points and scenario file
+[time_zero]
+use_base_scenarios = false   # true keeps the base projection's scenario table at time 0 instead of building a new one
+
+[logging]
+level = "INFO"          # DEBUG, INFO, WARNING or ERROR. DEBUG adds detail on API calls
+
+# Optional per-run overrides of the solver tuning defaults in settings.py
+[solver]
+# tolerance = 100000                              # Ending assets within +/- this amount count as converged
+# max_iterations = 5                              # Maximum rounds of guesses (3 runs per round)
+# provided_guess_brackets = [0.98, 1.00, 1.02]    # First-round multiples of initial_guess
+# derived_guess_brackets = [0.90, 0.995, 1.05]    # First-round multiples of a derived guess

@@ -57,21 +57,34 @@ solver working folder.
    **Never commit it, and never paste real key values into docs, tickets, or chat.**
    To switch between tenants, either edit `.env` or keep one file per tenant and set the
    `SLOPE_ENV_FILE` environment variable to the path of the one you want to use.
-3. Edit the run parameters at the top of `SBA_Solver/main.py`:
+3. Create a run file. Copy `SBA_Solver/runs/example.toml` to `SBA_Solver/runs/run.toml`
+   (the default), or to a name of your own such as `runs/2026Q3_base.toml`, and edit it.
+   At minimum, set:
    - `base_projection_id`
-   - `solver_time_points`
-4. Run from the repo root:
+   - `time_points`
+
+   The example's comments explain every option. Your run files are git-ignored; only the
+   example is committed.
+4. Run from the `SBA_Solver` folder:
    ```
-   python SBA_Solver/main.py
+   uv run python main.py                          # uses runs/run.toml
+   uv run python main.py runs/2026Q3_base.toml    # or any other run file
    ```
-   (Or use the "SBA Solver Module" launch config in `.vscode/launch.json`.)
+   Or use the "SBA Solver Module" launch config in `.vscode/launch.json`, which asks
+   for the run file (default `runs/run.toml`).
+
+To rerun, edit the run file or create another one, then run it again. You never need to
+edit `main.py`.
 
 ### Folder structure
 | File | Purpose |
 |---|---|
-| `main.py` | Entry point — sets run parameters, logging, and kicks off the solve |
+| `main.py` | Entry point — loads a run file, sets up logging, and kicks off the solve |
+| `runs/example.toml` | Template run file: base projection, time points, initial guess, log level and per-run solver tuning |
+| `runs/*.toml` | Your run files (git-ignored) |
+| `run_config.py` | Loads and checks run files (`RunConfig`, `SolverTuning`) |
 | `sba_solver.py` | `SbaSolver` class — all solver logic |
-| `settings.py` | Environment-level configuration (folders, table/product names, table overrides, tolerances) |
+| `settings.py` | Settings that rarely change: folders, table/product names, table overrides, and solver tuning defaults |
 | `reports.json` | Sigma report workbook/element IDs and filter keys |
 | `SBA Scenario Generator.xlsx` | Excel template used to build SBA scenario rate tables from a spot curve |
 | `pyproject.toml`, `uv.lock`, `.python-version` | Dependency/version management (Python 3.13) |
@@ -82,9 +95,15 @@ solver working folder.
 | `../.env` | Local, git-ignored credentials file (you create this) |
 
 ## 3. Script Architecture
-- **`main.py`** — Sets up logging, loads `reports.json` into `SigmaReportParams`
-  objects, instantiates `SbaSolver`, calls `calculate_bel()`, then
-  `print_results()`.
+- **`main.py`** — Loads and checks the run file (`run_config.load_run_config`), sets
+  up logging at the run file's level, logs the run settings, and loads `reports.json`
+  into `SigmaReportParams` objects. It then instantiates `SbaSolver` with the run's
+  solver tuning, calls `calculate_bel()`, `print_results()`, then `save_results()`.
+- **`run_config.py`** — `load_run_config(path)` reads a TOML run file into a `RunConfig`,
+  with its `[solver]` overrides applied over the `settings.py` defaults in
+  `SolverTuning`. Every problem is reported together, before credentials are loaded or
+  anything is sent to SLOPE: unknown settings (usually typos), missing or invalid values,
+  and guesses for time points that aren't being run.
 - **`sba_solver.py` — `SbaSolver` class** — Owns the whole workflow:
   - `__create_liability_cash_flows` — pulls liability cash flows from the base
     projection and sends them to SLOPE as the EPL Inputs data table (as row data —
@@ -103,10 +122,14 @@ solver working folder.
   - `calculate_bel_at_zero()` — a convenience method for solving only at time 0
     (copies the base projection with its own liabilities, assets and scenario rather than
     using the EPL product).
-  - `print_results()` — prints the collected `final_bel` list to console.
-- **`settings.py`** — Environment-level constants: credentials (loaded by
-  `Shared/credentials.py`), working folder, table/product/virtual-folder names,
-  solver table overrides, and solver tuning constants.
+  - `print_results()` — prints the collected `final_bel` list to console, flagging any
+    time point that didn't converge.
+  - `save_results(config)` — writes the results CSV and a copy of the run file to the
+    working folder (see [Outputs Produced](#7-outputs-produced)).
+- **`settings.py`** — Settings that rarely change for a model: working folder,
+  table/product/virtual-folder names, solver table overrides, and the solver tuning
+  defaults. Credentials are no longer loaded here; `SbaSolver` loads them from `.env`
+  when it starts.
 - **`reports.json`** — Maps logical report names (Asset MPF, Asset Products,
   Liability Cash Flows, Market Value Liability, Scenario Data, Solver Results) to
   Sigma workbook/element IDs and filter key names. These IDs are tenant-specific.
@@ -139,32 +162,48 @@ base projection. Before it is started, the solver:
 
 Every later solver run, including those at later time points, is a copy of that first solver
 run — it can be copied while it is still running. Each copy then gets its own pivot-point
-settings (start date, period, scenario table, asset model points) and starting-asset guess
-table before it is started.
+settings and starting-asset guess table before it is started:
+- **Time 0** keeps the base projection's asset model points, which are never rebuilt. With
+  `[time_zero] use_base_scenarios = true` in the run file, it also keeps the base
+  projection's scenario table instead of building and uploading a new scenario file.
+- **Other time points** always build and upload their own asset model points and scenario
+  file.
+
+Time points are solved in ascending order, so time 0 (if included) is solved first. Its
+first solver run is the copy of the base projection, so its runs carry the base
+projection's assets and scenarios.
 
 ## 4. Input Parameters
 
-### Dynamic — edit per run, in `main.py`
+### Per run — in a run file (`runs/*.toml`, see `runs/example.toml`)
+- `description` (optional) — written to the log and the results file to identify the run.
 - `base_projection_id` (int) — the base/source SLOPE projection to solve against.
   It must already be `Completed` or `CompletedWithErrors`, and it must contain the
   liability cash flows and portfolio the solver reads from.
-- `solver_time_points` (`list[int]`) — the pivot points, in months, at which to
+- `time_points` (`list[int]`) — the pivot points, in months, at which to
   solve for BEL (e.g. `[0]`, or `[0, 12, 24, 36, 48, 60, 120, 240]`).
 - `initial_guess` (optional) — the starting-asset value the solver starts from, in place of
   the value it derives. It can be:
-  - `None` (default): derive the guess at every time point from the market value of
+  - Left out (default): derive the guess at every time point from the market value of
     liabilities, falling back to the asset market value, then $10,000,000.
-  - A single number, e.g. `1500000000`: used at every time point.
-  - A dict keyed by time point, e.g. `{0: 1500000000, 12: 1450000000}`: time points not
-    in the dict derive their own guess.
+  - A single number, e.g. `initial_guess = 1500000000`: used at every time point.
+  - An `[initial_guess]` section with `all = ...` for every time point and/or values for
+    specific time points (e.g. `"12" = 1450000000`), which override `all`. Time points
+    with neither derive their own guess.
 
   A provided guess is bracketed tightly in the first round (`provided_guess_brackets`,
   default 98%, 100%, 102%). A derived guess is likely to be further off, so it is
   bracketed more widely (`derived_guess_brackets`, default 90%, 99.5%, 105%). A guess
   close to the answer (e.g. the BEL from a previous solve) usually converges in fewer
   iterations. The log shows whether each time point used a provided or derived guess.
-- `logging_level` — set inside `setup_logging()` in `main.py` (currently hardcoded
-  to `logging.INFO`); edit that line directly to change verbosity (e.g. `DEBUG`).
+- `[time_zero] use_base_scenarios` (default `false`) — `true` keeps the base projection's
+  scenario table at time 0 instead of building a new scenario file in Excel and uploading
+  it. Time 0 always uses the base projection's asset model points either way.
+- `[logging] level` — `DEBUG`, `INFO` (default), `WARNING` or `ERROR`. `DEBUG` adds
+  detail on API calls.
+- `[solver]` (optional) — per-run overrides of the solver tuning defaults in
+  `settings.py`: `tolerance`, `max_iterations`, `provided_guess_brackets` and
+  `derived_guess_brackets`.
 
 ### Static — configure once per environment, in `settings.py`
 - `solver_folder` — local scratch/working directory for intermediate files.
@@ -195,11 +234,15 @@ table before it is started.
   values converge faster but less precisely.
 - `provided_guess_brackets` / `derived_guess_brackets` — the multiples of the starting
   guess run in the first round. `provided_guess_brackets` (default `[0.98, 1.00, 1.02]`)
-  applies when `initial_guess` is given in `main.py`. `derived_guess_brackets` (default
+  applies when `initial_guess` is given in the run file. `derived_guess_brackets` (default
   `[0.90, 0.995, 1.05]`) applies when the guess is derived from the market value of
   liabilities or asset market value.
 - `solver_max_iterations` — max number of iteration rounds before giving up and
   returning the best guess found so far.
+
+The four solver tuning settings above (`solver_final_asset_tolerance`,
+`provided_guess_brackets`, `derived_guess_brackets`, `solver_max_iterations`) are defaults.
+A run file can override them in its `[solver]` section.
 
 ### One-time SLOPE-side setup
 No projection template is needed. The model used by the base projection must have:
@@ -256,7 +299,8 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
 `SLOPE_ENV_FILE` overrides which `.env` file credentials are loaded from.
 
 ## 5. Execution Flow
-1. `main.py` sets up logging and loads `reports.json`.
+1. `main.py` loads and checks the run file, sets up logging, logs the run settings, and
+   loads `reports.json`.
 2. `SbaSolver.__init__` loads credentials from `.env`, authorizes against the SLOPE API,
    confirms the base projection is completed, and resolves table structure IDs by name.
    It then runs the **setup check** (`__validate_setup`) before any data is retrieved or
@@ -272,7 +316,8 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
      field so the file can be created.
    
    All problems are reported together in one error.
-3. `calculate_bel(solver_time_points)`:
+3. `calculate_bel(time_points, initial_guesses, use_base_scenarios_at_time_zero)` solves
+   the time points in ascending order:
    - Pulls the base projection's liability cash flows and sends them to SLOPE as the
      `<base_projection_id> Cash Flows` EPL data table (`__create_liability_cash_flows`).
      If that table already exists from a previous run, its rows are replaced. If the base
@@ -280,8 +325,9 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
      flow time, and the base projection's own EPL Inputs table is used instead.
    - For each pivot point (`__solve_at_time`):
      - Looks up market value of liabilities at that point.
-     - Generates a scenario file and asset MPFs at the pivot point (time 0 reuses the
-       base projection's own asset model points).
+     - At time points other than 0, builds and uploads asset MPFs and a scenario file at
+       the pivot point. Time 0 keeps the base projection's asset MPFs, and also its
+       scenario table if `use_base_scenarios` is set; otherwise it builds a scenario file.
      - Brackets three initial starting-asset guesses around the starting guess:
        `initial_guess` if provided for this time point, at `provided_guess_brackets`
        (98%, 100%, 102%). Otherwise, the market value of liabilities at
@@ -319,6 +365,8 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
          closest result for the scenario with the highest estimated BEL, and logs the
          maximum potential error (half the width of that scenario's bracket).
 4. `print_results()` prints the collected BEL per time point to console.
+5. `save_results()` writes the results CSV and a copy of the run file to the working
+   folder.
 
 ## 6. API Integration Points
 - **Auth**: `SlopeApi.authorize(api_key, api_secret)`, with credentials from
@@ -344,9 +392,14 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
 ## 7. Outputs Produced
 - **Local**, under `solver_folder/<base_projection_id>/`:
   - `sba_scenarios_time_<time_index>.xlsx` — generated scenario file per pivot
-    point.
+    point (not for time 0 when `use_base_scenarios` is set).
   - `EPL Model Point File.csv` — only on the run that first creates the EPL model point
     file.
+  - `results_<timestamp>.csv` — one row per time point: base projection, description,
+    time, BEL, the projection and scenario it came from, whether it converged, its ending
+    assets, the maximum potential error if it didn't converge, and the run file copy.
+  - `run_<timestamp>.toml` — a copy of the run file used, so each result can be traced
+    back to its inputs.
   - Downloaded Sigma report CSVs land under `~/Slope API/Reports/` (or
     `SLOPE_REPORTS_DIR`).
 - **SLOPE-side**:
@@ -359,10 +412,8 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
   - The solver projections, named `SBA Solver Projection-<base_projection_id> Time-<time> Guess <n>`
     and filed under the `virtual_folder_name` virtual folder. The guess number matches the
     starting-assets table used by that run.
-- **Final BEL results**: collected in `SbaSolver.final_bel` and printed to console
-  via `print_results()`. **There is currently no automatic export to CSV/Excel** —
-  if you need a persisted results file, capture the console output or add an
-  export step.
+- **Final BEL results**: collected in `SbaSolver.final_bel`, printed to console via
+  `print_results()`, and saved to `results_<timestamp>.csv` via `save_results()`.
 
 ## 8. Error Handling and Logging
 - The solve loop in `calculate_bel()` is not currently wrapped in exception
@@ -370,10 +421,8 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
   a failure partway through a multi-time-point run will abort without any
   restart/checkpoint context, and any projections/tables already created in SLOPE
   will remain there.
-- When convergence isn't reached within `solver_max_iterations`, an estimate of
-  maximum potential BEL error is computed but only
-  surfaced via a log message — it is not included in `final_bel` or
-  `print_results()` output.
+- When convergence isn't reached within `solver_max_iterations`, the maximum potential
+  BEL error is logged, flagged by `print_results()`, and saved in the results CSV.
 - **Automatic retries for intermittent API failures** (`Shared/slope_api.py`, used by both
   solvers):
   - **What is retried:** every SLOPE API call, on every method including POST and PATCH.
@@ -406,13 +455,20 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
 - **SLOPE-side naming changes**: update `starting_asset_table_name`, `epl_table_name`,
   `virtual_folder_name`, `epl_product_name`, `epl_liability_id_field`, or the keys and
   column names in `solver_table_overrides` in `settings.py` to match.
-- **Convergence speed/precision trade-offs**: tune
-  `solver_final_asset_tolerance` and `solver_max_iterations` in `settings.py`, or pass
-  an `initial_guess` in `main.py`.
+- **Convergence speed/precision trade-offs**: tune the solver tuning defaults in
+  `settings.py`, override them for one run in the run file's `[solver]` section, or set
+  an `initial_guess` in the run file.
+- **New run inputs**: add them to `runs/example.toml` (with a comment), `RunConfig` and
+  its checks in `run_config.py`, and the allowed keys for their section.
 - **Credentials**: each user/environment needs their own local `.env` file in the repo
   root with `SLOPE_API_KEY`/`SLOPE_API_SECRET`; never commit this file.
 
 ## 10. Troubleshooting Tips
+- **"Run file '...' not found"**: copy `runs/example.toml` to `runs/run.toml` (or pass the
+  path of your run file), and run from the `SBA_Solver` folder.
+- **"Run file '...' has problems"**: every problem is listed. "Unknown setting(s)" is
+  usually a typo, e.g. `time_point` for `time_points`. Compare with
+  `runs/example.toml`.
 - **"SLOPE_API_KEY and SLOPE_API_SECRET must be set"**: the `.env` file is missing or
   incomplete. Copy `env.example` to `.env` in the repo root and fill it in, or check
   `SLOPE_ENV_FILE` if you have set it.

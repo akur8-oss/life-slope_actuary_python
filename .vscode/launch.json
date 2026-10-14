@@ -13,6 +13,7 @@
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}/SBA_Solver",
             "python": "${workspaceFolder}/SBA_Solver/.venv/bin/python",
+            "args": ["${input:sbaRunFile}"],
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/SBA_Solver"
             },
@@ -28,6 +29,15 @@
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/PBR_Solver"
             },
+        }
+    ],
+    "inputs": [
+        {
+            // SBA solver run file, relative to the SBA_Solver folder. Copy runs/example.toml to create one
+            "id": "sbaRunFile",
+            "type": "promptString",
+            "description": "SBA solver run file (relative to SBA_Solver)",
+            "default": "runs/run.toml"
         }
     ]
 }

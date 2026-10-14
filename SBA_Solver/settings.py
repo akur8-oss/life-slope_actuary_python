@@ -1,9 +1,10 @@
 import os
 from pathlib import Path
-from Shared.credentials import get_api_credentials
+import Shared.credentials  # noqa: F401 - loads the git-ignored .env file at the repo root, which can set SLOPE_WORKING_DIR
 
-# SLOPE API credentials are read from the git-ignored file at the repo root (see env.example)
-api_key, api_secret = get_api_credentials()
+# Settings that rarely change for a model. Run inputs (base projection, time points, initial guess) are set in a run
+# file - see runs/example.toml. The solver tuning settings at the bottom are defaults, which a run file can override in
+# its [solver] section
 
 # Scratch/working folder for intermediate solver files.
 # Override per-machine with the SLOPE_WORKING_DIR env var; otherwise default
@@ -48,8 +49,9 @@ shared_solver_tables = {
     "Company Properties": "SBA Solver Company Properties",
 }
 
+# Solver tuning defaults
 solver_final_asset_tolerance = 100000       # tolerance for remaining assets for the BEL solve - Higher tolerances will converge faster
-# Multiples of the starting guess run in the first round of guesses: tight around a guess provided in main.py, wider
+# Multiples of the starting guess run in the first round of guesses: tight around a guess provided in the run file, wider
 # around a guess derived from the market value of liabilities (or asset market value), which is likely further off
 provided_guess_brackets = [0.98, 1.00, 1.02]
 derived_guess_brackets = [0.90, 0.995, 1.05]

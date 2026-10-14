@@ -6,6 +6,8 @@ import logging
 import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows
 import settings
+from run_config import RunConfig, SolverTuning
+from Shared.credentials import get_api_credentials
 from Shared.sigma_report import SigmaReport, SigmaReportParams
 from Shared.slope_api import SlopeApi
 import shutil
@@ -16,7 +18,6 @@ import xlwings as xw
 
 
 class SbaSolver:
-    final_bel = []
     liability_cashflows_table_id = 0
 
     solver_folder = ""
@@ -24,8 +25,6 @@ class SbaSolver:
     __asset_market_value = 0
     __base_projection = {}
     __last_cf_time = 0
-    __max_iterations = settings.solver_max_iterations
-    __tolerance = settings.solver_final_asset_tolerance
 
     # Columns the solver writes to each table it uploads to SLOPE - checked against the table structures before the solve starts
     EPL_COLUMNS = ["Date", "Cash Flow", "Liability ID", "Scenario Number"]
@@ -43,11 +42,18 @@ class SbaSolver:
         generate_scenario_file: bool = True
         initial_guess: float | None = None   # Starting assets to bracket the first guesses around. Derived if None
 
-    def __init__(self, projection_id: int, reports: dict[str, SigmaReportParams]):
+    # tuning is the solver tuning for this run (from the run file). Defaults to the values in settings.py
+    def __init__(self, projection_id: int, reports: dict[str, SigmaReportParams], tuning: SolverTuning | None = None):
         self.reports = reports
         self.base_projection_id = projection_id
+        self.final_bel = []
+        self.__tuning = tuning or SolverTuning()
+        self.__tolerance = self.__tuning.tolerance
+        self.__max_iterations = self.__tuning.max_iterations
+        # SLOPE API credentials are read from the git-ignored .env file at the repo root (see env.example)
+        api_key, api_secret = get_api_credentials()
         self.api = SlopeApi()
-        self.api.authorize(settings.api_key, settings.api_secret)
+        self.api.authorize(api_key, api_secret)
         self.solver_folder = settings.solver_folder / str(projection_id)
         self.solver_folder.mkdir(parents=True, exist_ok=True)
         self.slope_file_path = f"SBA Solver/{projection_id}"
@@ -202,15 +208,22 @@ class SbaSolver:
                                                  initial_guess=initial_guess)
         result = self.__solve_at_time(solve_params)
  
-        self.final_bel.append({"Time": 0, "BEL": result["bel"], "ProjectionId": result["projectionId"],
-                               "Scenario": result["scenario"]})
+        self.final_bel.append(self.__final_result(0, result))
 
     # initial_guesses is optional: a single starting-asset guess used for every time point, or a dict of guesses keyed by
     # time point. Any time point without a guess derives its own from the market value of liabilities
-    def calculate_bel(self, time_indexes:list[int], initial_guesses: float | dict[int, float] | None = None):
+    # Time 0 always keeps the base projection's asset model points. With use_base_scenarios_at_time_zero, it also keeps the
+    # base projection's scenario table instead of building and uploading a new scenario file. Other time points always
+    # build their own asset model points and scenario file
+    def calculate_bel(self, time_indexes:list[int], initial_guesses: float | dict[int, float] | None = None,
+                      use_base_scenarios_at_time_zero: bool = False):
         if len(time_indexes) == 0:
             logging.info("No time indexes specified for BEL solver routine.")
             return []
+
+        # Solve in time order, so time 0 is solved first. Its first solver projection is a copy of the base projection, so
+        # it keeps the base projection's assets (and scenarios), and every later solver run is copied from it
+        time_indexes = sorted(time_indexes)
 
         logging.info(f"Starting SBA Solver for the following time points:")
         logging.info(time_indexes)
@@ -224,38 +237,55 @@ class SbaSolver:
         self.__create_liability_cash_flows(base_report_params)
 
         for time_idx in time_indexes:
-            solve_params = SbaSolver.TimeSolveParams(time_idx, initial_guess=self.__get_initial_guess(initial_guesses, time_idx))
+            at_time_zero = time_idx == 0
+            if at_time_zero:
+                logging.info("Time 0 uses the base projection's asset model points" +
+                             (" and scenario table" if use_base_scenarios_at_time_zero else ""))
+            solve_params = SbaSolver.TimeSolveParams(time_idx,
+                                                     generate_asset_files=not at_time_zero,
+                                                     generate_scenario_file=not (at_time_zero and use_base_scenarios_at_time_zero),
+                                                     initial_guess=self.__get_initial_guess(initial_guesses, time_idx))
             result = self.__solve_at_time(solve_params)
-            self.final_bel.append({"Time": time_idx, "BEL": result["bel"], "ProjectionId": result["projectionId"], "Scenario": result["scenario"]})
+            self.final_bel.append(self.__final_result(time_idx, result))
 
         # except Exception as e:
         #    logging.info(e)
         #    logging.info(traceback.format_exc())
         #    logging.info("SBA Solver Failed - BEL could not be calculated")
 
+    @staticmethod
+    def __final_result(time_index: int, result: dict) -> dict:
+        return {"Time": time_index, "BEL": result["bel"], "ProjectionId": result["projectionId"],
+                "Scenario": result["scenario"], "Converged": result["converged"],
+                "Ending Assets": result.get("endingAssets", 0), "Max Error": result.get("maxError", "")}
+
     def print_results(self):
         print("Results:")
         for result in self.final_bel:
-            print(f"Time {result['Time']}: Projection({result['ProjectionId']}) Scenario({result['Scenario']}) BEL: {result['BEL']}")
+            converged = "" if result["Converged"] else f" - NOT CONVERGED, max error {result['Max Error']}"
+            print(f"Time {result['Time']}: Projection({result['ProjectionId']}) Scenario({result['Scenario']}) BEL: {result['BEL']}{converged}")
+
+    # Save the results and a copy of the run file to the solver working folder, so each result can be traced back to
+    # the inputs that produced it. Returns the results file path
+    def save_results(self, config: RunConfig) -> Path:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_copy = self.solver_folder / f"run_{timestamp}.toml"
+        shutil.copyfile(config.path, run_copy)
+
+        results = pd.DataFrame(self.final_bel)
+        results.insert(0, "Base Projection", self.base_projection_id)
+        results.insert(1, "Description", config.description)
+        results["Run File"] = run_copy.name
+        results_file = self.solver_folder / f"results_{timestamp}.csv"
+        results.to_csv(results_file, index=False)
+        logging.info(f"Saved results to '{results_file}' and a copy of the run file to '{run_copy}'")
+        return results_file
 
     def __create_asset_mpfs(self, time_index, report_params):
         products_report = SigmaReport(self.api, self.reports["Asset Products"])
         products_report.retrieve(report_params)
         products = products_report.get_data()
         self.__asset_market_value = products['Market Value at Pivot Time'].sum()
-
-        if time_index == 0:
-            # For time 0, we can just use the existing asset MPFs from the base projection
-            base_products = self.__base_projection.get("portfolios")[0].get("products")
-
-            # Create a list of asset objects from the base projection products
-            assets = []
-            for product in base_products:
-                if product.get("productType") == "Asset":
-                    assets.append({"productName": product.get("name"),
-                               "modelPointFile": product.get("modelPointFile")})
-
-            return assets
 
         assets = []
         report = SigmaReport(self.api, self.reports["Asset MPF"])
@@ -274,6 +304,12 @@ class SbaSolver:
                            "modelPointFile": {"fileId": file_id}})
 
         return assets
+
+    # Returns the total asset market value at the pivot point
+    def __get_asset_market_value(self, report_params) -> float:
+        products_report = SigmaReport(self.api, self.reports["Asset Products"])
+        products_report.retrieve(report_params)
+        return products_report.get_data()['Market Value at Pivot Time'].sum()
 
     def __create_liability_cash_flows(self, report_params):
         # Get Liability cash flows from SLOPE
@@ -563,7 +599,8 @@ class SbaSolver:
             return {"bel": 0,
                     "tolerance": 0,
                     "projectionId": 0,
-                    "scenario": 0
+                    "scenario": 0,
+                    "converged": True
                     }
 
         logging.info(f"Solving for BEL at time {params.time_index}:")
@@ -621,13 +658,16 @@ class SbaSolver:
         # further off, so it is bracketed more widely
         if params.initial_guess is not None:
             starting_guess = params.initial_guess
-            brackets = settings.provided_guess_brackets
+            brackets = self.__tuning.provided_guess_brackets
             logging.info(f"Using provided initial guess of {starting_guess:,.2f} with brackets {brackets}")
         else:
+            if market_value_liabilities <= 0 and not params.generate_asset_files:
+                # The asset market value is only known when the asset model points are built, so look it up instead
+                self.__asset_market_value = self.__get_asset_market_value(pivot_point_report_params)
             starting_guess = market_value_liabilities if market_value_liabilities > 0 else self.__asset_market_value
             if starting_guess <= 0:
                 starting_guess = 10000000  # If both MVL and Asset MV are 0 or negative, just start at 10 million
-            brackets = settings.derived_guess_brackets
+            brackets = self.__tuning.derived_guess_brackets
             logging.info(f"Using derived initial guess of {starting_guess:,.2f} with brackets {brackets}")
         solver_projections = []
         guess_num = 1
@@ -670,7 +710,7 @@ class SbaSolver:
         logging.info(f"No projection within tolerance after {self.__max_iterations} iterations.")
         logging.info(f"Best guess of {best_point['value']:,.2f} in scenario {binding} with final difference of {abs(best_point['result']):,.2f}.")
         logging.info(f"Maximum Potential Error in BEL: {self.max_error}")
-        return self.__solver_result(binding, best_point)
+        return self.__solver_result(binding, best_point) | {"converged": False, "maxError": self.max_error}
 
     # Returns the solver result for a scenario's point
     @staticmethod
@@ -699,7 +739,7 @@ class SbaSolver:
                        for point in points):
                 return None
 
-        return self.__solver_result(binding, converged[binding])
+        return self.__solver_result(binding, converged[binding]) | {"converged": True}
 
     def __start_run(self, starting_assets: list[float], time_index, projection_params, guess_num: int, use_epl: bool) -> int:
         # Write new starting asset values to a table
