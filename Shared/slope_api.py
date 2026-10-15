@@ -33,6 +33,7 @@ class _TimeoutHTTPAdapter(HTTPAdapter):
 
 class SlopeApi:
     api_url = "https://api.slopesoftware.com/api"
+    app_url = "https://app.slopesoftware.com"
     max_data_table_rows = 100000  # API limit for row data table endpoints (also limited to 10MB per request)
     # Retries for intermittent failures: connection errors, timeouts and these HTTP statuses, on every method
     max_retries = 5
@@ -507,6 +508,11 @@ class SlopeApi:
         if not response.ok:
             raise Exception(f"Failed to start projection with id: {projection_id}", response.text)
         
+    # Link to a projection's details in the SLOPE app
+    @staticmethod
+    def projection_url(projection_id: int) -> str:
+        return f"{SlopeApi.app_url}/ModelResults/FinancialProjection/DetailsTabView/{projection_id}"
+
     # Update values and properties on a projection
     def update_projection(self, projection_id, properties):
         self.__keep_alive()

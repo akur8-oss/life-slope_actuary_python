@@ -162,7 +162,12 @@ base projection. Before it is started, the solver:
 
 Every later solver run, including those at later time points, is a copy of that first solver
 run — it can be copied while it is still running. Each copy then gets its own pivot-point
-settings and starting-asset guess table before it is started:
+settings and starting-asset guess table before it is started. The pivot-point settings are
+the start date (the valuation date at the pivot point) and the period, which ends the run at
+the last non-zero liability cash flow, so ending assets are measured when the liabilities run
+out. The Liability Cash Flows report can continue with zero cash flows to the end of the base
+projection; those months are not projected. A time point at or after the last non-zero cash
+flow has a BEL of 0 and is not run.
 - **Time 0** keeps the base projection's asset model points, which are never rebuilt. With
   `[time_zero] use_base_scenarios = true` in the run file, it also keeps the base
   projection's scenario table instead of building and uploading a new scenario file.
@@ -320,9 +325,10 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
    the time points in ascending order:
    - Pulls the base projection's liability cash flows and sends them to SLOPE as the
      `<base_projection_id> Cash Flows` EPL data table (`__create_liability_cash_flows`).
-     If that table already exists from a previous run, its rows are replaced. If the base
-     projection already uses the EPL product, the report is only read to find the last cash
-     flow time, and the base projection's own EPL Inputs table is used instead.
+     If that table already exists from a previous run, its rows are replaced. The last
+     non-zero cash flow time is taken from the report and sets where every solver run ends.
+     If the base projection already uses the EPL product, the report is only read to find
+     that time, and the base projection's own EPL Inputs table is used instead.
    - For each pivot point (`__solve_at_time`):
      - Looks up market value of liabilities at that point.
      - At time points other than 0, builds and uploads asset MPFs and a scenario file at
@@ -397,7 +403,8 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
     file.
   - `results_<timestamp>.csv` — one row per time point: base projection, description,
     time, BEL, the projection and scenario it came from, whether it converged, its ending
-    assets, the maximum potential error if it didn't converge, and the run file copy.
+    assets, the maximum potential error if it didn't converge, the iterations (rounds of
+    guesses) and projections run, how long the time point took, and the run file copy.
   - `run_<timestamp>.toml` — a copy of the run file used, so each result can be traced
     back to its inputs.
   - Downloaded Sigma report CSVs land under `~/Slope API/Reports/` (or
@@ -411,9 +418,15 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
     Manager.
   - The solver projections, named `SBA Solver Projection-<base_projection_id> Time-<time> Guess <n>`
     and filed under the `virtual_folder_name` virtual folder. The guess number matches the
-    starting-assets table used by that run.
+    starting-assets table used by that run. Once a time point is solved, the projection its
+    BEL came from is renamed, replacing `Guess <n>` with `Solved`, or with
+    `Closest - Not Converged` if no run was within tolerance (the closest run is used). If
+    the rename fails, a warning is logged and the solve carries on.
 - **Final BEL results**: collected in `SbaSolver.final_bel`, printed to console via
   `print_results()`, and saved to `results_<timestamp>.csv` via `save_results()`.
+- **Summary log**: at the end, the solver logs the total time taken (including setup) and,
+  for each time point, the BEL, whether it was solved, the iterations and projections run,
+  the time taken, and a link to the final projection in SLOPE.
 
 ## 8. Error Handling and Logging
 - The solve loop in `calculate_bel()` is not currently wrapped in exception
@@ -497,7 +510,7 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
   says the base projection has no data table set, set that table on the base projection.
 - **"Liability Cash Flows report returned columns ..."**: the Sigma report's columns no
   longer match `EPL_REPORT_COLUMNS` (`Time Index`, `Date`, `Cash Flow`) in `sba_solver.py`.
-  `Time Index` is only used to find the last cash flow time and is not uploaded. Update the
+  `Time Index` is only used to find the last non-zero cash flow time and is not uploaded. Update the
   report or the list.
 - **EPL product produces no cash flows**: the EPL model point file is reused once created.
   If it was created with the wrong fields, delete `epl_mpf_path` from the SLOPE File

@@ -44,6 +44,7 @@ class SbaSolver:
 
     # tuning is the solver tuning for this run (from the run file). Defaults to the values in settings.py
     def __init__(self, projection_id: int, reports: dict[str, SigmaReportParams], tuning: SolverTuning | None = None):
+        self.__start_time = time.monotonic()  # The total time reported at the end includes this setup
         self.reports = reports
         self.base_projection_id = projection_id
         self.final_bel = []
@@ -206,9 +207,10 @@ class SbaSolver:
 
         solve_params = SbaSolver.TimeSolveParams(0, use_epl=False, generate_asset_files=False, generate_scenario_file=False,
                                                  initial_guess=initial_guess)
-        result = self.__solve_at_time(solve_params)
- 
+        result = self.__solve_at_time(solve_params) | {"duration": time.monotonic() - self.__start_time}
+        self.__name_final_projection(0, result)
         self.final_bel.append(self.__final_result(0, result))
+        self.__log_summary(time.monotonic() - self.__start_time)
 
     # initial_guesses is optional: a single starting-asset guess used for every time point, or a dict of guesses keyed by
     # time point. Any time point without a guess derives its own from the market value of liabilities
@@ -237,6 +239,7 @@ class SbaSolver:
         self.__create_liability_cash_flows(base_report_params)
 
         for time_idx in time_indexes:
+            time_point_start = time.monotonic()
             at_time_zero = time_idx == 0
             if at_time_zero:
                 logging.info("Time 0 uses the base projection's asset model points" +
@@ -245,8 +248,11 @@ class SbaSolver:
                                                      generate_asset_files=not at_time_zero,
                                                      generate_scenario_file=not (at_time_zero and use_base_scenarios_at_time_zero),
                                                      initial_guess=self.__get_initial_guess(initial_guesses, time_idx))
-            result = self.__solve_at_time(solve_params)
+            result = self.__solve_at_time(solve_params) | {"duration": time.monotonic() - time_point_start}
+            self.__name_final_projection(time_idx, result)
             self.final_bel.append(self.__final_result(time_idx, result))
+
+        self.__log_summary(time.monotonic() - self.__start_time)
 
         # except Exception as e:
         #    logging.info(e)
@@ -257,7 +263,44 @@ class SbaSolver:
     def __final_result(time_index: int, result: dict) -> dict:
         return {"Time": time_index, "BEL": result["bel"], "ProjectionId": result["projectionId"],
                 "Scenario": result["scenario"], "Converged": result["converged"],
-                "Ending Assets": result.get("endingAssets", 0), "Max Error": result.get("maxError", "")}
+                "Ending Assets": result.get("endingAssets", 0), "Max Error": result.get("maxError", ""),
+                "Iterations": result["iterations"], "Projections Run": result["projections"],
+                "Duration": SbaSolver.__format_duration(result["duration"])}
+
+    # Rename the projection picked for a time point's BEL, replacing "Guess #" in its name with "Solved", or with
+    # "Closest - Not Converged" if no run was within tolerance. A failed rename is logged but doesn't stop the solve
+    def __name_final_projection(self, time_index: int, result: dict):
+        if not result["projectionId"]:
+            return  # No projection was run (BEL is 0 after the last cash flow)
+        name = self.__projection_name(time_index, "Solved" if result["converged"] else "Closest - Not Converged")
+        try:
+            self.api.update_projection(result["projectionId"], {"name": name})
+            logging.info(f"Renamed projection {result['projectionId']} to '{name}'")
+        except Exception as e:
+            logging.warning(f"Could not rename projection {result['projectionId']} to '{name}': {e}")
+
+    # Name of a solver projection, e.g. "SBA Solver Projection-200794 Time-0 Guess 3"
+    def __projection_name(self, time_index: int, suffix: str) -> str:
+        return f"SBA Solver Projection-{self.base_projection_id} Time-{time_index} {suffix}"
+
+    # Log how long the solve took, and for each time point the result, rounds of guesses, projections run and a link to
+    # the projection picked in SLOPE
+    def __log_summary(self, total_seconds: float):
+        lines = [f"SBA Solver finished in {SbaSolver.__format_duration(total_seconds)}"]
+        for result in self.final_bel:
+            status = "solved" if result["Converged"] else f"NOT CONVERGED (closest run, max error {result['Max Error']})"
+            line = (f"  Time {result['Time']}: BEL {result['BEL']:,.2f} {status} - {result['Iterations']} iterations, "
+                    f"{result['Projections Run']} projections, {result['Duration']}")
+            if result["ProjectionId"]:
+                line += f"\n    Projection {result['ProjectionId']}: {SlopeApi.projection_url(result['ProjectionId'])}"
+            lines.append(line)
+        logging.info("\n".join(lines))
+
+    @staticmethod
+    def __format_duration(seconds: float) -> str:
+        minutes, seconds = divmod(round(seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m {seconds:02d}s" if hours else f"{minutes}m {seconds:02d}s"
 
     def print_results(self):
         print("Results:")
@@ -321,8 +364,14 @@ class SbaSolver:
         if sorted(epl_data.columns) != sorted(SbaSolver.EPL_REPORT_COLUMNS):
             raise ValueError(f"Liability Cash Flows report returned columns {list(epl_data.columns)}. Expected {SbaSolver.EPL_REPORT_COLUMNS}")
 
-        # Find time of last cash flow - we must explicitly convert this from a numpy.int64 type to an int here, otherwise it will fail to be serialized in json later
-        self.__last_cf_time = int(epl_data["Time Index"].max())
+        # Find time of last non-zero cash flow, when the liabilities run out. The report can continue with zero cash flows
+        # to the end of the base projection, but the solver runs must stop here so ending assets are measured when the
+        # liabilities run out. We must explicitly convert this from a numpy.int64 type to an int here, otherwise it will
+        # fail to be serialized in json later
+        non_zero_times = epl_data.loc[epl_data["Cash Flow"] != 0, "Time Index"]
+        self.__last_cf_time = int(non_zero_times.max()) if len(non_zero_times) else 0
+        logging.info(f"Last non-zero liability cash flow is at time {self.__last_cf_time} "
+                     f"(report runs to time {int(epl_data['Time Index'].max())})")
 
         # The base projection's own EPL Inputs table is used by the solver runs, so no new table is needed
         if self.base_uses_epl:
@@ -594,13 +643,15 @@ class SbaSolver:
 
 
     def __solve_at_time(self, params: TimeSolveParams) -> dict:
-        if params.time_index > self.__last_cf_time:
-            logging.info("Time is after last liability cash flow time. BEL is 0.")
+        if params.time_index >= self.__last_cf_time:
+            logging.info("Time is at or after last liability cash flow time. BEL is 0.")
             return {"bel": 0,
                     "tolerance": 0,
                     "projectionId": 0,
                     "scenario": 0,
-                    "converged": True
+                    "converged": True,
+                    "iterations": 0,
+                    "projections": 0
                     }
 
         logging.info(f"Solving for BEL at time {params.time_index}:")
@@ -620,10 +671,11 @@ class SbaSolver:
         logging.info(f"Valuation Date: {valuation_date}")
         logging.info(f"Market Value Liabilities: {market_value_liabilities}")
 
-        # Projection Parameters expected below
+        # Projection Parameters expected below. The start date is time index t, so a period of N months ends at time
+        # index t + N - the projection ends at the last liability cash flow
         solver_projection_parameters = {
             "startDate": valuation_date.isoformat(),
-            "periodInMonths": self.__last_cf_time - params.time_index + 1,
+            "periodInMonths": self.__last_cf_time - params.time_index,
             "virtualFolders": [settings.virtual_folder_name]
         }
 
@@ -689,7 +741,7 @@ class SbaSolver:
                 if converged is not None:
                     logging.info(f"BEL converged at {converged['bel']:,.2f} in scenario {converged['scenario']} "
                                  f"(projection {converged['projectionId']}, ending assets {converged['endingAssets']:,.2f})")
-                    return converged
+                    return converged | {"iterations": i + 1, "projections": guess_num - 1}
 
             # Not converged - work out the next round of guesses for each scenario
             next_guesses, states = self.__solve_next_guess(guesses, starting_guess)
@@ -710,7 +762,8 @@ class SbaSolver:
         logging.info(f"No projection within tolerance after {self.__max_iterations} iterations.")
         logging.info(f"Best guess of {best_point['value']:,.2f} in scenario {binding} with final difference of {abs(best_point['result']):,.2f}.")
         logging.info(f"Maximum Potential Error in BEL: {self.max_error}")
-        return self.__solver_result(binding, best_point) | {"converged": False, "maxError": self.max_error}
+        return self.__solver_result(binding, best_point) | {"converged": False, "maxError": self.max_error,
+                                                            "iterations": self.__max_iterations, "projections": guess_num - 1}
 
     # Returns the solver result for a scenario's point
     @staticmethod
@@ -758,7 +811,7 @@ class SbaSolver:
             SlopeApi.dataframe_to_rows(df, self.starting_assets_table_columns))
 
         # Create a new projection from the requested source
-        projection_name = f"SBA Solver Projection-{self.base_projection_id} Time-{time_index} Guess {guess_num}"
+        projection_name = self.__projection_name(time_index, f"Guess {guess_num}")
         if use_epl and self.first_solver_projection_id is not None:
             # Copy the first solver projection, which already has the EPL product and solver tables set up
             logging.info(f"Creating new copy of first solver projection {self.first_solver_projection_id}")
