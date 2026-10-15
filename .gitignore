@@ -10,6 +10,15 @@ wheels/
 # Virtual environments
 .venv
 
+# SBA solver run files - Local Only (only the example is committed)
+SBA_Solver/runs/*
+!SBA_Solver/runs/example.toml
+
 # API Keys - Local Only
 */keys.py
 Shared/keys.py
+
+# Environment files with credentials - Local Only
+.env
+.env.*
+!.env.example

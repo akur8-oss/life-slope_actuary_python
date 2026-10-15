@@ -26,11 +26,11 @@ pip install requests pandas python-dateutil urllib3
    ```
 2. **Install dependencies** (if not already installed):
    ```bash
-   pip install requests pandas python-dateutil urllib3
+   pip install requests pandas python-dateutil urllib3 python-dotenv
    ```
-3. **Set credentials** in `Shared/keys.py`:
-   - `api_key`
-   - `api_secret`
+3. **Set credentials**: copy `env.example` at the repo root to `.env` (git-ignored) and fill in:
+   - `SLOPE_API_KEY`
+   - `SLOPE_API_SECRET`
 4. **Set inputs** in `PBR_Solver/main.py`:
    - `projection_id = <your projection id>`
    - Optional: adjust `logging_level`
@@ -49,7 +49,7 @@ Key directories/files under `PBR_Solver`:
 - `vm20_params.py`: Dataclasses for runtime and restart parameters.【F:PBR_Solver/vm20_params.py†L5-L24】
 - `guess_iteration.py`: Tracks successive asset guesses for secant updates.【F:PBR_Solver/guess_iteration.py†L3-L8】
 - `reports.json`: Sigma report IDs and filters used for data pulls.【F:PBR_Solver/reports.json†L1-L26】
-- `Shared/`: Common API, report, and credential helpers (`slope_api.py`, `sigma_report.py`, `keys.py`).【F:PBR_Solver/main.py†L6-L10】
+- `Shared/`: Common API, report, and credential helpers (`slope_api.py`, `sigma_report.py`, `credentials.py`).【F:PBR_Solver/main.py†L6-L10】
 
 ## 3. Script Architecture
 - **Entry point (`main.py`)**: Sets logging, loads report metadata, assembles `VM20Params`, optional `VM20RestartParams`, and calls `VM20.solve_asset_collar`.【F:PBR_Solver/main.py†L21-L74】
@@ -65,7 +65,7 @@ Key directories/files under `PBR_Solver`:
 - `VM20Params` values like scenario sample size, min scenarios, max iterations, template name, and table structure names tailor run behaviour.【F:PBR_Solver/main.py†L45-L55】【F:PBR_Solver/vm20_params.py†L5-L24】
 
 ### Static inputs (configured once per environment)
-- API credentials from `Shared/keys.py` referenced in `VM20Params`.【F:PBR_Solver/main.py†L6-L55】【F:Shared/keys.py†L1-L4】 Ensure they are set to your tenant values.
+- API credentials loaded from the repo-root `.env` file by `Shared/credentials.py` and passed into `VM20Params`.【F:PBR_Solver/main.py†L6-L55】 Ensure they are set to your tenant values.
 - `reports.json` workbook/element IDs and filter keys that map to Sigma reports used by the solver (Scenario Reserves, Liability Cash Flows, Starting Assets).【F:PBR_Solver/reports.json†L1-L26】【F:PBR_Solver/main.py†L29-L55】
 - Working directory root (`VM20Params.working_directory`) where CSVs are stored locally; defaults to `c:\Slope API\VM20`.【F:PBR_Solver/vm20_params.py†L5-L18】
 
@@ -104,6 +104,6 @@ Key directories/files under `PBR_Solver`:
 ## 9. Troubleshooting Tips
 - **No scenarios or starting assets found**: Ensure the projection ID is valid and Sigma report filters in `reports.json` match your tenant; missing data raises a `ValueError`.【F:PBR_Solver/vm20.py†L158-L277】【F:PBR_Solver/reports.json†L1-L26】
 - **Convergence not reached**: Check `max_iterations`, sample size settings, and restart with `initial_guesses` if available to resume secant steps from the last iteration. Logs show guess/difference history.【F:PBR_Solver/vm20.py†L293-L360】【F:PBR_Solver/guess_iteration.py†L3-L8】
-- **API errors (401/403/409/etc.)**: Verify API keys in `Shared/keys.py`, confirm the user has access to referenced models/templates/tables, and review logged response bodies from `SlopeApi.__check_response`.【F:Shared/keys.py†L1-L4】【F:Shared/slope_api.py†L28-L143】
+- **API errors (401/403/409/etc.)**: Verify `SLOPE_API_KEY`/`SLOPE_API_SECRET` in the repo-root `.env`, confirm the user has access to referenced models/templates/tables, and review logged response bodies from `SlopeApi.__check_response`.【F:Shared/slope_api.py†L28-L143】
 - **Table upload shape mismatches**: If EPL or starting asset uploads fail, confirm table structure column names in SLOPE match those expected in `__get_liability_cashflows` and `__create_starting_asset_table`; update names or add columns accordingly.【F:PBR_Solver/vm20.py†L131-L226】
 - **Long-running reports**: The API retry logic waits and retries report downloads if generation is slow; rerun with higher logging to watch the retry loop.【F:Shared/slope_api.py†L208-L239】

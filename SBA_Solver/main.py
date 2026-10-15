@@ -7,21 +7,16 @@ import json
 import os
 import logging
 import sba_solver
+from run_config import load_run_config
 from Shared.sigma_report import SigmaReportParams
 
-# SBA Solver parameters
-# The ID of the base liability cash flow projection
-base_projection_id = 59776
-
-# List of the pivot points at which you want to run the solver. It will solve for BEL at ech of these time points in the above projection
-solver_time_points = [0]
-# solver_time_points = [0, 12, 24, 36, 48, 60, 120, 240]
+# Run the SBA solver for a run file. Run inputs (base projection, time points, initial guess) are set in the run file,
+# not here - see runs/example.toml
+#   uv run python main.py                       (uses runs/run.toml)
+#   uv run python main.py runs/<your run>.toml
 
 
-def setup_logging():
-    # Change this to appropriate level for your run
-    logging_level = logging.INFO
-
+def setup_logging(logging_level: str):
     # Setup Logger
     log_formatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s]  %(message)s")
     root_logger = logging.getLogger()
@@ -43,14 +38,19 @@ def get_reports_data() -> dict[str, SigmaReportParams]:
 
     return reports_data
 
-def run():
-    setup_logging()
-    reports = get_reports_data()
-    solver = sba_solver.SbaSolver(base_projection_id, reports)
+def run(run_file: str | None = None):
+    # Load and check the run file before anything is sent to SLOPE
+    config = load_run_config(run_file)
+    setup_logging(config.log_level)
+    config.log_summary()
 
-    solver.calculate_bel(solver_time_points)
+    reports = get_reports_data()
+    solver = sba_solver.SbaSolver(config.base_projection_id, reports, config.solver)
+
+    solver.calculate_bel(config.time_points, config.initial_guesses, config.use_base_scenarios_at_time_zero)
     solver.print_results()
+    solver.save_results(config)
 
 
 if __name__ == "__main__":
-    run()
+    run(sys.argv[1] if len(sys.argv) > 1 else None)

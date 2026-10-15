@@ -1,10 +1,10 @@
 import os
 from pathlib import Path
-from Shared.keys import api_key as key, api_secret as secret
+import Shared.credentials  # noqa: F401 - loads the git-ignored .env file at the repo root, which can set SLOPE_WORKING_DIR
 
-# Substitute Real API credentials here
-api_key = key
-api_secret = secret
+# Settings that rarely change for a model. Run inputs (base projection, time points, initial guess) are set in a run
+# file - see runs/example.toml. The solver tuning settings at the bottom are defaults, which a run file can override in
+# its [solver] section
 
 # Scratch/working folder for intermediate solver files.
 # Override per-machine with the SLOPE_WORKING_DIR env var; otherwise default
@@ -17,21 +17,43 @@ solver_folder = Path(
 # resolved relative to this file so it works on any OS without manual copying.
 sba_scenario_generator = Path(__file__).parent / "SBA Scenario Generator.xlsx"
 
-# Usage Notes
-# The sba_template_name specified in this setting MUST have the following:
-# 1. A single portfolio named 'Inforce Portfolio' (this can be changed by changing the projection update template below)
-# 2. The proper reinvestment strategy must be set up on the specified template
-# 3. The asset scaling variable needs to be set on the Projection Portfolio
-# 4. The Portfolio Parameters Table that is used should include Initial Asset Scaling Type of '4' in the data table
-# 5. The Company Properties Table should be set to
-#       Capital Method 'None',
-#       Distribute Earnings: False
-#       Tax Rate: 0
-sba_template_name = "SBA Solver Template"                    # The name of the projection template to be used within the solver
 starting_asset_table_name = "Initial Asset Scaling"          # The name of the starting assets table
 epl_table_name = "EPL Inputs"                                # The name of the EPL Input Table
 virtual_folder_name = "SBA Solver"                           # The name of the virtual folder in SLOPE to store projections in Slope
 
-solver_final_asset_tolerance = 100000        # tolerance for remaining assets for the BEL solve - Higher tolerances will converge faster
-solver_max_iterations = 4                   # The maximum number of attempts to solve for BEL. If max iterations is exceeded, the last closes guess outside the tolerance will be used
-next_guess_range = 0.20                     # Check a 20% weighted average range around the last guess
+# Solver projections - the first solver run is built automatically from the base projection, later runs are copied from it
+# Liability products on the base projection are replaced by this single Externally Projected Liability product
+epl_product_name = "Externally Projected Liability"          # The name of the EPL product on the model
+epl_liability_id_field = "ID"                                # EPL model point field set to "BEL" to link to the 'Liability ID' rows of the EPL Inputs table
+epl_mpf_path = "SBA Solver/EPL Model Point File.csv"         # File Manager path of the EPL model point file - created on first run, then reused.
+                                                             # When created, date fields (e.g. Issue Date) are set to the base projection start date
+
+# Column values overridden on the base projection's tables for the solver runs, keyed by Table Structure name
+# A copy of the table used on the base projection is saved with these values on every row and set on the solver projections
+solver_table_overrides = {
+    "Portfolio Parameters": {
+        "Initial Asset Scaling": "Use Asset Scaling Table",
+    },
+    "Company Properties": {
+        "Required Capital Method": "None",
+        "Distribute Earnings?": "false",
+        "Tax Rate": "0",
+    },
+}
+
+# Override tables shared by every SBA solve, keyed by Table Structure name, with the data table name to use
+# The table is created once from the base projection's table if it doesn't exist, then reused for every solve. If it
+# exists, its overridden column values are checked and corrected if needed. Any table not listed here is saved per
+# base projection as '<base projection id> SBA <table structure>'
+shared_solver_tables = {
+    "Company Properties": "SBA Solver Company Properties",
+}
+
+# Solver tuning defaults
+solver_final_asset_tolerance = 100000       # tolerance for remaining assets for the BEL solve - Higher tolerances will converge faster
+# Multiples of the starting guess run in the first round of guesses: tight around a guess provided in the run file, wider
+# around a guess derived from the market value of liabilities (or asset market value), which is likely further off
+provided_guess_brackets = [0.98, 1.00, 1.02]
+derived_guess_brackets = [0.90, 0.995, 1.05]
+
+solver_max_iterations = 5                   # The maximum number of attempts to solve for BEL. If max iterations is exceeded, the last closes guess outside the tolerance will be used
