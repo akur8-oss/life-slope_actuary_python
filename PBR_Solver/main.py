@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from Shared.keys import *
+from Shared.credentials import get_api_credentials
 import logging
 from guess_iteration import GuessIteration
 from Shared.sigma_report import SigmaReportParams
@@ -41,6 +41,7 @@ def parse_reports_json() -> dict[str, SigmaReportParams]:
 
 if __name__ == '__main__':
     setup_logging()
+    api_key, api_secret = get_api_credentials()
 
     params = VM20Params(
         api_key=api_key,

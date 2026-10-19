@@ -8,6 +8,7 @@ dependencies = [
     "openpyxl>=3.1.5",
     "pandas>=2.2.3",
     "python-dateutil>=2.9.0.post0",
+    "python-dotenv>=1.2.4",
     "requests>=2.32.3",
     # xlwings drives the installed MS Excel to recalculate workbook formulas.
     # Cross-platform: macOS via AppleScript, Windows via COM.
