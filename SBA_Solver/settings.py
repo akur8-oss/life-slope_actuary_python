@@ -50,7 +50,9 @@ shared_solver_tables = {
 }
 
 # Solver tuning defaults
-solver_final_asset_tolerance = 100000       # tolerance for remaining assets for the BEL solve - Higher tolerances will converge faster
+# A scenario is solved when EITHER tolerance is met. Both are fractions (0.000001 = 0.0001%) and higher values converge faster
+solver_ending_assets_tolerance_pct = 0.00002  # a run is solved when its ending assets are within this fraction of its starting assets
+solver_bel_tolerance_pct = 0.000001           # a scenario is solved when the BEL is known to within this fraction (guaranteed error)
 # Multiples of the starting guess run in the first round of guesses: tight around a guess provided in the run file, wider
 # around a guess derived from the market value of liabilities (or asset market value), which is likely further off
 provided_guess_brackets = [0.98, 1.00, 1.02]

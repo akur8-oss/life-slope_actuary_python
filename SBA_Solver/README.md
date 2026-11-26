@@ -114,7 +114,7 @@ edit `main.py`.
   - `__solve_at_time` — for a given pivot point, gets market value of liabilities,
     optionally generates asset MPFs and a scenario file, brackets an initial guess,
     and iterates the secant method via `__start_run` / `__get_solver_results` /
-    `__solve_next_guess` until convergence or `solver_max_iterations` is reached.
+    `next_round_guesses` until convergence or `solver_max_iterations` is reached.
   - `__create_scenario_file` — writes a spot curve into `SBA Scenario Generator.xlsx`
     and drives Excel (via `xlwings`) to recalculate it before uploading to SLOPE.
   - `calculate_bel(time_indexes)` — the main public entry point, solves BEL at every
@@ -139,8 +139,8 @@ The first solver run (the first guess at the first time point) is built from a c
 base projection. Before it is started, the solver:
 1. Sets the run settings used for every solver run (Output All Results is left as set on
    the base projection): any scenario
-   filter (`scenarioSubset`) on the base projection removed so every guess runs all
-   scenarios, the `virtual_folder_name` virtual folder, and the EPL Inputs table holding the base
+   filter (`scenarioSubset`) on the base projection removed so the first round of guesses runs all
+   scenarios (later rounds set it to just the scenarios still being solved), the `virtual_folder_name` virtual folder, and the EPL Inputs table holding the base
    projection's liability cash flows. If the base projection already uses the EPL product,
    its own EPL Inputs table is kept instead.
 2. Applies `solver_table_overrides`: for each listed table structure (by default Portfolio
@@ -207,8 +207,8 @@ projection's assets and scenarios.
 - `[logging] level` — `DEBUG`, `INFO` (default), `WARNING` or `ERROR`. `DEBUG` adds
   detail on API calls.
 - `[solver]` (optional) — per-run overrides of the solver tuning defaults in
-  `settings.py`: `tolerance`, `max_iterations`, `provided_guess_brackets` and
-  `derived_guess_brackets`.
+  `settings.py`: `ending_assets_tolerance_pct`, `bel_tolerance_pct`, `max_iterations`,
+  `provided_guess_brackets` and `derived_guess_brackets`.
 
 ### Static — configure once per environment, in `settings.py`
 - `solver_folder` — local scratch/working directory for intermediate files.
@@ -235,8 +235,18 @@ projection's assets and scenarios.
   are kept in line with `solver_table_overrides`; the other columns are copied from the base
   projection that created the table. To rebuild it from a different base, delete or rename
   it in SLOPE.
-- `solver_final_asset_tolerance` — convergence tolerance on ending assets; higher
-  values converge faster but less precisely.
+- `solver_ending_assets_tolerance_pct` and `solver_bel_tolerance_pct` — the two
+  convergence tolerances. A scenario is solved when **either** is met. Both are fractions,
+  so `0.000001` is 0.0001%, and higher values converge faster but less precisely.
+  - `solver_ending_assets_tolerance_pct` (default `0.00002`, about $92,000 of ending
+    assets on a 4.6bn BEL): a run is solved when its ending assets are within this fraction
+    of its starting assets.
+  - `solver_bel_tolerance_pct` (default `0.000001`, about $4,600 on a 4.6bn BEL): a
+    scenario is solved when its BEL is known to within this fraction. The lowest starting
+    assets with enough assets (positive ending assets) must be within this fraction of the
+    highest starting assets without enough (negative ending assets), so the BEL is
+    guaranteed to be within that range. This needs no estimate of the slope, and means the
+    same on every time point and product.
 - `provided_guess_brackets` / `derived_guess_brackets` — the multiples of the starting
   guess run in the first round. `provided_guess_brackets` (default `[0.98, 1.00, 1.02]`)
   applies when `initial_guess` is given in the run file. `derived_guess_brackets` (default
@@ -245,8 +255,9 @@ projection's assets and scenarios.
 - `solver_max_iterations` — max number of iteration rounds before giving up and
   returning the best guess found so far.
 
-The four solver tuning settings above (`solver_final_asset_tolerance`,
-`provided_guess_brackets`, `derived_guess_brackets`, `solver_max_iterations`) are defaults.
+The solver tuning settings above (`solver_ending_assets_tolerance_pct`,
+`solver_bel_tolerance_pct`, `provided_guess_brackets`, `derived_guess_brackets`,
+`solver_max_iterations`) are defaults.
 A run file can override them in its `[solver]` section.
 
 ### One-time SLOPE-side setup
@@ -293,7 +304,8 @@ correct on the base projection before you run the solver.
 The solver handles these automatically, so they don't need any setup:
 - **Liability products.** Replaced with the Externally Projected Liability product, or
   kept if the base projection already uses it.
-- **Scenario filters.** Removed, so every run covers all scenarios.
+- **Scenario filters.** Removed, so the first round covers all scenarios. Later rounds
+  run only the scenarios still being solved (see Convergence below).
 
 Also required: Sigma reports published matching the workbook/element IDs in
 `reports.json`. If reports are moved or republished, or this solver is pointed at a
@@ -344,32 +356,56 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
      - Iterates in rounds of three runs, started together, up to `solver_max_iterations`
        rounds. Each scenario has its own starting assets in every run, so each scenario
        is solved separately using every result so far.
-       - **Convergence** (`__check_convergence`), checked after each run: the BEL has
-         converged when the scenario with the highest starting assets within
-         `solver_final_asset_tolerance` of 0 ending assets is found. Every other scenario
-         must have a result at or below that starting value with ending assets ≥ 0, or
-         within tolerance. Those scenarios need fewer assets and don't set the BEL, so
-         they don't need to be solved exactly. This assumes ending assets increase with
-         starting assets.
-       - **Next guesses** (`__solve_next_guess`), for each scenario:
-         - If results on both sides of 0 bracket the answer, the mid guess is an inverse
-           quadratic interpolation through the closest results. If that falls outside
-           the bracket, it uses the secant through the bracket ends instead, and if
-           ending assets don't rise across the bracket it bisects it.
-         - Otherwise, the mid guess extrapolates the secant through the two results
-           closest to 0, limited to 4 times the range tried so far.
-         - The low and high guesses sit either side of the mid guess, spaced by how
-           uncertain the estimate is: the gap between the quadratic and secant estimates,
-           and never less than the starting-asset equivalent of the tolerance. They are
-           kept inside the bracket, so each round is likely to leave a narrow bracket
-           around the answer.
+       - **Scenario status** (`scenario_status.update_statuses`), updated after each run. Each
+         scenario is `Active` (still being solved), `Converged` (either a run has ending
+         assets within `solver_ending_assets_tolerance_pct` of its starting assets, or the
+         BEL is known to within `solver_bel_tolerance_pct` - see above), or `Non-binding`. A scenario is
+         non-binding when it has positive ending assets (outside tolerance) at starting
+         assets v, so it needs less than v, and another scenario has a run at v or higher
+         that is within tolerance or has negative ending assets, so that scenario needs
+         at least as much. It can't set the BEL, so it is no longer solved. This assumes
+         ending assets increase with starting assets. The lower end of the BEL range comes
+         from any scenario: the BEL is above every starting assets with negative ending assets.
+       - **Convergence**: the BEL has converged when no scenario is `Active`. It is the
+         starting assets of the converged scenario with the highest starting assets: its run
+         within the ending assets tolerance if it has one, otherwise its lowest run with enough
+         assets. When every scenario that can set the BEL has a run with enough assets, the log
+         also gives the range the BEL is guaranteed to be in (`BEL Error` in the results file).
+       - **Every scenario is run in every projection**, so the projection the BEL comes
+         from (and every other solver projection) has all scenarios on it for reporting. Only
+         the scenarios still `Active` get new guesses and have their results used. A
+         `Converged` or `Non-binding` scenario is run at its reporting guess in all three
+         projections of each later round: the starting assets of its run with the smallest
+         ending assets that are not negative, so it always has enough assets. If it has no such
+         run (it converged within the ending assets tolerance from below), its next high guess
+         is used. Its results are ignored, so they never change when the BEL is considered
+         solved. This repeats some calculations, but costs no extra projections. The results
+         report must contain every scenario, otherwise the solver raises an error. The
+         "Scenario Runs" count in the log and results CSV is the total scenarios run across all
+         projections.
+       - **Next guesses** (`next_round_guesses` and `next_scenario_guesses` in
+         `scenario_status.py`), for each scenario still to solve:
+         - The mid guess is an inverse quadratic interpolation through the three results
+           closest to 0 ending assets, on either side of 0. Ending assets are curved near
+           the answer, so a straight line through two points always misses it. With fewer
+           than three usable results it uses the secant through the closest two. With no
+           usable slope it bisects the bracket, or steps 1% towards 0 ending assets.
+         - The low and high guesses sit either side of the mid guess, spaced 1.5 times the
+           gap between the quadratic and secant estimates (a measure of how curved the
+           results are), and never less than the starting-asset equivalent of the
+           tolerance.
+         - If results on both sides of 0 bracket the answer, the mid guess is kept inside
+           the bracket (bisecting it if the estimate falls outside) and the spacing is
+           limited to a third of the bracket.
        - **Logging**: each run's results (scenario, starting and ending assets) are
          logged. After each round, a table of every scenario's best result, bracket,
-         method and next guesses is logged, along with the scenario with the highest
-         estimated BEL.
+         method and next guesses is logged, along with the number of scenarios still to solve and the
+         scenario with the highest estimated BEL among them. Scenarios that converge or become
+         non-binding are logged when it happens.
        - If it hasn't converged after `solver_max_iterations` rounds, it returns the
-         closest result for the scenario with the highest estimated BEL, and logs the
-         maximum potential error (half the width of that scenario's bracket).
+         closest result for the scenario with the highest estimated BEL (converged scenarios count at their
+         converged value; non-binding ones are ignored), and logs the maximum potential error (half
+         the width of the widest bracket of the scenarios still to solve).
 4. `print_results()` prints the collected BEL per time point to console.
 5. `save_results()` writes the results CSV and a copy of the run file to the working
    folder.
@@ -404,7 +440,7 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
   - `results_<timestamp>.csv` — one row per time point: base projection, description,
     time, BEL, the projection and scenario it came from, whether it converged, its ending
     assets, the maximum potential error if it didn't converge, the iterations (rounds of
-    guesses) and projections run, how long the time point took, and the run file copy.
+    guesses), projections run and scenario runs, how long the time point took, and the run file copy.
   - `run_<timestamp>.toml` — a copy of the run file used, so each result can be traced
     back to its inputs.
   - Downloaded Sigma report CSVs land under `~/Slope API/Reports/` (or
@@ -420,7 +456,7 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
     and filed under the `virtual_folder_name` virtual folder. The guess number matches the
     starting-assets table used by that run. Once a time point is solved, the projection its
     BEL came from is renamed, replacing `Guess <n>` with `Solved`, or with
-    `Closest - Not Converged` if no run was within tolerance (the closest run is used). If
+    `Closest - Not Converged` if neither tolerance was met (the closest run is used). If
     the rename fails, a warning is logged and the solve carries on.
 - **Final BEL results**: collected in `SbaSolver.final_bel`, printed to console via
   `print_results()`, and saved to `results_<timestamp>.csv` via `save_results()`.
@@ -493,7 +529,8 @@ overrides where downloaded Sigma report CSVs are saved (default `~/Slope API`).
   them.
 - **Convergence not reached within `solver_max_iterations`**: check the logged
   "Maximum Potential Error in BEL" message; consider raising
-  `solver_max_iterations` or relaxing `solver_final_asset_tolerance`.
+  `solver_max_iterations` or relaxing `solver_bel_tolerance_pct` or
+  `solver_ending_assets_tolerance_pct`.
 - **API errors (401/403/409, etc.)**: verify the credentials in `.env` are
   current, and confirm the API user has access to the referenced projection,
   model, and table structures in SLOPE.

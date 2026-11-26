@@ -15,7 +15,8 @@ LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
 # Solver tuning. Defaults come from settings.py and can be overridden per run in the [solver] section of a run file
 @dataclass(frozen=True)
 class SolverTuning:
-    tolerance: float = settings.solver_final_asset_tolerance
+    ending_assets_tolerance_pct: float = settings.solver_ending_assets_tolerance_pct
+    bel_tolerance_pct: float = settings.solver_bel_tolerance_pct
     max_iterations: int = settings.solver_max_iterations
     provided_guess_brackets: list[float] = field(default_factory=lambda: list(settings.provided_guess_brackets))
     derived_guess_brackets: list[float] = field(default_factory=lambda: list(settings.derived_guess_brackets))
@@ -51,7 +52,7 @@ class RunConfig:
 _TOP_LEVEL_KEYS = {"description", "base_projection_id", "time_points", "initial_guess", "logging", "time_zero", "solver"}
 _LOGGING_KEYS = {"level"}
 _TIME_ZERO_KEYS = {"use_base_scenarios"}
-_SOLVER_KEYS = {"tolerance", "max_iterations", "provided_guess_brackets", "derived_guess_brackets"}
+_SOLVER_KEYS = {"ending_assets_tolerance_pct", "bel_tolerance_pct", "max_iterations", "provided_guess_brackets", "derived_guess_brackets"}
 
 
 def load_run_config(path: str | Path | None = None) -> RunConfig:
@@ -153,9 +154,11 @@ def _parse_solver(section, errors: list[str]) -> SolverTuning:
     if not _check_section(section, "solver", _SOLVER_KEYS, errors):
         return defaults
 
-    tolerance = section.get("tolerance", defaults.tolerance)
-    if not _is_number(tolerance) or tolerance <= 0:
-        errors.append(f"solver.tolerance must be a positive number, got {tolerance!r}")
+    tolerances = {}
+    for name in ("ending_assets_tolerance_pct", "bel_tolerance_pct"):
+        tolerances[name] = section.get(name, getattr(defaults, name))
+        if not _is_number(tolerances[name]) or not 0 < tolerances[name] < 1:
+            errors.append(f"solver.{name} must be a fraction between 0 and 1, e.g. 0.000001 for 0.0001%, got {tolerances[name]!r}")
 
     max_iterations = section.get("max_iterations", defaults.max_iterations)
     if not _is_int(max_iterations) or max_iterations < 1:
@@ -169,7 +172,7 @@ def _parse_solver(section, errors: list[str]) -> SolverTuning:
             errors.append(f"solver.{name} must be a list of 3 positive multiples of the guess, e.g. [0.98, 1.00, 1.02], "
                           f"got {brackets[name]!r}")
 
-    return SolverTuning(tolerance=tolerance, max_iterations=max_iterations, **brackets)
+    return SolverTuning(**tolerances, max_iterations=max_iterations, **brackets)
 
 
 def _check_section(section, name: str, allowed: set[str], errors: list[str]) -> bool:

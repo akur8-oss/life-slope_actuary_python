@@ -42,7 +42,9 @@ level = "INFO"          # DEBUG, INFO, WARNING or ERROR. DEBUG adds detail on AP
 
 # Optional per-run overrides of the solver tuning defaults in settings.py
 [solver]
-# tolerance = 100000                              # Ending assets within +/- this amount count as converged
+# A scenario is solved when EITHER tolerance is met. Both are fractions, so 0.000001 is 0.0001%. Higher values converge faster
+# ending_assets_tolerance_pct = 0.00002           # A run with ending assets within this fraction of its starting assets
+# bel_tolerance_pct = 0.000001                    # The BEL is known to within this fraction (a guaranteed error), e.g. 0.000001 is $4,600 on a 4.6bn BEL
 # max_iterations = 5                              # Maximum rounds of guesses (3 runs per round)
 # provided_guess_brackets = [0.98, 1.00, 1.02]    # First-round multiples of initial_guess
 # derived_guess_brackets = [0.90, 0.995, 1.05]    # First-round multiples of a derived guess

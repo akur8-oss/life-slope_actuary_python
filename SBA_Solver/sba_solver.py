@@ -7,6 +7,8 @@ import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows
 import settings
 from run_config import RunConfig, SolverTuning
+from scenario_status import ScenarioStatus, update_statuses, binding_converged, next_round_guesses, \
+    Tolerances, bel_range
 from Shared.credentials import get_api_credentials
 from Shared.sigma_report import SigmaReport, SigmaReportParams
 from Shared.slope_api import SlopeApi
@@ -33,6 +35,9 @@ class SbaSolver:
     EPL_REPORT_COLUMNS = ["Time Index", "Date", "Cash Flow"]
     # Number of scenario rows written to the starting assets table for each guess
     SCALING_TABLE_ROWS = 10
+    # Fewest scenario rows the Solver Results report returns once a projection with every scenario is loaded. The first round
+    # runs every scenario, so this is how a partly loaded report is recognised before the scenarios are known
+    MIN_SCENARIO_ROWS = 9
 
     @dataclass
     class TimeSolveParams:
@@ -49,7 +54,7 @@ class SbaSolver:
         self.base_projection_id = projection_id
         self.final_bel = []
         self.__tuning = tuning or SolverTuning()
-        self.__tolerance = self.__tuning.tolerance
+        self.__tolerances = Tolerances(self.__tuning.ending_assets_tolerance_pct, self.__tuning.bel_tolerance_pct)
         self.__max_iterations = self.__tuning.max_iterations
         # SLOPE API credentials are read from the git-ignored .env file at the repo root (see env.example)
         api_key, api_secret = get_api_credentials()
@@ -264,7 +269,9 @@ class SbaSolver:
         return {"Time": time_index, "BEL": result["bel"], "ProjectionId": result["projectionId"],
                 "Scenario": result["scenario"], "Converged": result["converged"],
                 "Ending Assets": result.get("endingAssets", 0), "Max Error": result.get("maxError", ""),
+                "BEL Error": result.get("belError") if result.get("belError") is not None else "",
                 "Iterations": result["iterations"], "Projections Run": result["projections"],
+                "Scenario Runs": result["scenarioRuns"],
                 "Duration": SbaSolver.__format_duration(result["duration"])}
 
     # Rename the projection picked for a time point's BEL, replacing "Guess #" in its name with "Solved", or with
@@ -289,8 +296,10 @@ class SbaSolver:
         lines = [f"SBA Solver finished in {SbaSolver.__format_duration(total_seconds)}"]
         for result in self.final_bel:
             status = "solved" if result["Converged"] else f"NOT CONVERGED (closest run, max error {result['Max Error']})"
+            if result["Converged"] and result["BEL Error"] != "":
+                status += f" within {result['BEL Error']:,.2f}"
             line = (f"  Time {result['Time']}: BEL {result['BEL']:,.2f} {status} - {result['Iterations']} iterations, "
-                    f"{result['Projections Run']} projections, {result['Duration']}")
+                    f"{result['Projections Run']} projections ({result['Scenario Runs']} scenario runs), {result['Duration']}")
             if result["ProjectionId"]:
                 line += f"\n    Projection {result['ProjectionId']}: {SlopeApi.projection_url(result['ProjectionId'])}"
             lines.append(line)
@@ -610,8 +619,13 @@ class SbaSolver:
         return scenario_table_id
 
     # Wait for a solver projection to finish and add its results to guesses: a list of points
-    # {"value": starting assets, "result": ending assets, "projectionId"} for each scenario
-    def __get_solver_results(self, projection_id, guesses: dict[int, list[dict]]):
+    # {"value": starting assets, "result": ending assets, "projectionId"} for each scenario. expected_scenarios is the
+    # set of scenarios the projection ran, which the report must contain exactly. It is None for the first round, before the
+    # scenarios are known. Every projection runs every scenario, but only the results of record_scenarios are added to
+    # guesses - the scenarios that were still being solved when the projection started. The others were run at their best
+    # guess only so the projection has every scenario on it, and must not affect the solve. None records every scenario
+    def __get_solver_results(self, projection_id, guesses: dict[int, list[dict]], expected_scenarios: set[int] | None = None,
+                             record_scenarios: set[int] | None = None):
         # Wait for projection to finish
         while self.api.is_projection_running(projection_id):
             status = self.api.get_projection_status(projection_id)
@@ -623,14 +637,23 @@ class SbaSolver:
         report.retrieve({"Projection-ID": f"{projection_id}"})
         sba_result = report.get_data()
 
-        if len(sba_result) < 9:
-            # Data is not loaded to Snowflake yet, so wait and try again up to 5 times
-            for attempt in range(5):
-                time.sleep(20)  # Wait 20 seconds before retrying
-                report.retrieve({"Projection-ID": f"{projection_id}"})
-                sba_result =report.get_data()
-                if (len(sba_result) >= 9):
-                    break
+        def is_complete(data: pd.DataFrame) -> bool:
+            if expected_scenarios is None:
+                return len(data) >= SbaSolver.MIN_SCENARIO_ROWS
+            return {int(scenario) for scenario in data["Scenario Number"]} == expected_scenarios
+
+        # If the data is not loaded to Snowflake yet, wait and try again up to 5 times
+        for attempt in range(5):
+            if is_complete(sba_result):
+                break
+            time.sleep(20)  # Wait 20 seconds before retrying
+            report.retrieve({"Projection-ID": f"{projection_id}"})
+            sba_result = report.get_data()
+
+        if expected_scenarios is not None and not is_complete(sba_result):
+            returned = {int(scenario) for scenario in sba_result["Scenario Number"]}
+            raise ValueError(f"Solver results for projection {projection_id} do not have the scenarios it ran. "
+                             f"Missing {sorted(expected_scenarios - returned)}, unexpected {sorted(returned - expected_scenarios)}")
 
         logging.info(f"Solver results for projection {projection_id}:\n"
                      f"{sba_result[['Scenario Number', 'Starting Assets', 'Ending Assets']].to_string(index=False)}")
@@ -638,6 +661,8 @@ class SbaSolver:
         # Save results for each scenario for the solver
         for _, row in sba_result.iterrows():
             scenario = int(row['Scenario Number'])
+            if record_scenarios is not None and scenario not in record_scenarios:
+                continue
             guesses.setdefault(scenario, []).append({"value": row['Starting Assets'], "result": row['Ending Assets'],
                                                      "projectionId": projection_id})
 
@@ -651,7 +676,8 @@ class SbaSolver:
                     "scenario": 0,
                     "converged": True,
                     "iterations": 0,
-                    "projections": 0
+                    "projections": 0,
+                    "scenarioRuns": 0
                     }
 
         logging.info(f"Solving for BEL at time {params.time_index}:")
@@ -721,49 +747,83 @@ class SbaSolver:
                 starting_guess = 10000000  # If both MVL and Asset MV are 0 or negative, just start at 10 million
             brackets = self.__tuning.derived_guess_brackets
             logging.info(f"Using derived initial guess of {starting_guess:,.2f} with brackets {brackets}")
+        # (projection ID, scenarios its report must contain, scenarios whose results are used). Both are None in the first
+        # round, as the scenarios are not known until its results are back
         solver_projections = []
         guess_num = 1
 
-        # First round - run the low, mid and high multiples of the starting guess
+        # First round - run the low, mid and high multiples of the starting guess. Every scenario is run
         for bracket in brackets:
             starting_assets = [starting_guess * bracket] * SbaSolver.SCALING_TABLE_ROWS
-            solver_projections.append(self.__start_run(starting_assets, params.time_index, solver_projection_parameters, guess_num, params.use_epl))
+            solver_projections.append((self.__start_run(starting_assets, params.time_index, solver_projection_parameters,
+                                                        guess_num, params.use_epl), None, None))
             guess_num += 1
 
-        # Iteration - each round runs the low, mid and high guesses at the same time. After each run, check whether the
-        # BEL has converged using every result so far
+        # Iteration - each round runs the low, mid and high guesses at the same time. Every scenario is run, but only the
+        # scenarios that still need solving get new guesses and have their results used. After each run, update every
+        # scenario's status using all results so far. The solve ends when no scenario is left to solve
         guesses: dict[int, list[dict]] = {}
+        status: dict[int, ScenarioStatus] = {}
         states = {}
+        scenario_runs = 0
         for i in range(self.__max_iterations):
-            for projection_id in solver_projections:
-                self.__get_solver_results(projection_id, guesses)
-                converged = self.__check_convergence(guesses)
-                if converged is not None:
-                    logging.info(f"BEL converged at {converged['bel']:,.2f} in scenario {converged['scenario']} "
-                                 f"(projection {converged['projectionId']}, ending assets {converged['endingAssets']:,.2f})")
-                    return converged | {"iterations": i + 1, "projections": guess_num - 1}
+            for projection_id, expected, record in solver_projections:
+                self.__get_solver_results(projection_id, guesses, expected, record)
+                if not status:
+                    # The first results give the scenarios that exist. The first round ran all of them in every projection
+                    status = {scenario: ScenarioStatus.ACTIVE for scenario in guesses}
+                    scenario_runs += len(status) * len(brackets)
+                self.__log_status_changes(update_statuses(guesses, status, self.__tolerances))
 
-            # Not converged - work out the next round of guesses for each scenario
-            next_guesses, states = self.__solve_next_guess(guesses, starting_guess)
-            self.__log_solver_state(i + 1, states)
+                if ScenarioStatus.ACTIVE not in status.values():
+                    scenario, point = binding_converged(guesses, status, self.__tolerances)
+                    logging.info(f"BEL converged at {point['value']:,.2f} in scenario {scenario} "
+                                 f"(projection {point['projectionId']}, ending assets {point['result']:,.2f})")
+                    # The range the BEL is guaranteed to be in, if every scenario that can set the BEL has a run with enough assets
+                    known_range = bel_range(guesses, status)
+                    bel_error = known_range[1] - known_range[0] if known_range else None
+                    if known_range:
+                        logging.info(f"BEL is guaranteed to be between {known_range[0]:,.2f} and {known_range[1]:,.2f}, "
+                                     f"within {bel_error:,.2f} ({bel_error / known_range[1]:.7%})")
+                    return self.__solver_result(scenario, point) | {"converged": True, "iterations": i + 1, "belError": bel_error,
+                                                                    "projections": guess_num - 1, "scenarioRuns": scenario_runs}
 
-            # if not at max iterations, run the next round of guesses
+            # Not converged - work out the next round of guesses for each scenario still to solve
+            next_guesses, new_states = next_round_guesses(guesses, status, self.__tolerances, starting_guess, SbaSolver.SCALING_TABLE_ROWS)
+            states.update(new_states)
+            self.__log_solver_state(i + 1, new_states, status)
+
+            # If not at max iterations, run the next round of guesses. Every scenario is run so the projection the BEL comes
+            # from has them all, but only the results of the scenarios still to solve are used
             if i < self.__max_iterations - 1:
+                active = {scenario for scenario, current in status.items() if current == ScenarioStatus.ACTIVE}
                 solver_projections = []
                 for guess in next_guesses:
-                    solver_projections.append(self.__start_run(guess, params.time_index, solver_projection_parameters, guess_num, params.use_epl))
+                    solver_projections.append((self.__start_run(guess, params.time_index, solver_projection_parameters,
+                                                                guess_num, params.use_epl), set(status), active))
                     guess_num += 1
+                    scenario_runs += len(status)
 
-        # Not converged - use the closest result for the scenario with the highest estimated BEL
-        binding = max(states, key=lambda scenario: states[scenario]["estimate"])
-        best_point = min(guesses[binding], key=lambda point: abs(point["result"]))
-        state = states[binding]
-        self.max_error = "Unknown" if state["lower"] is None else str((state["upper"] - state["lower"]) / 2)
+        # Not converged - use the closest result for the scenario with the highest estimated BEL. A converged scenario's
+        # estimate is its converged starting assets. Non-binding scenarios can't set the BEL
+        estimates = {scenario: states[scenario]["estimate"] for scenario, current in status.items()
+                     if current == ScenarioStatus.ACTIVE and scenario in states}
+        converged = binding_converged(guesses, status, self.__tolerances)
+        if converged is not None:
+            estimates[converged[0]] = converged[1]["value"]
+        binding = max(estimates, key=estimates.get)
+        best_point = converged[1] if converged is not None and binding == converged[0] \
+            else min(guesses[binding], key=lambda point: abs(point["result"]))
+        # The most the BEL could be out by is half the widest bracket of the scenarios still to solve
+        widths = [(states[scenario]["upper"] - states[scenario]["lower"]) / 2 for scenario in estimates
+                  if status[scenario] == ScenarioStatus.ACTIVE and states[scenario]["lower"] is not None]
+        self.max_error = str(max(widths)) if widths else "Unknown"
         logging.info(f"No projection within tolerance after {self.__max_iterations} iterations.")
         logging.info(f"Best guess of {best_point['value']:,.2f} in scenario {binding} with final difference of {abs(best_point['result']):,.2f}.")
         logging.info(f"Maximum Potential Error in BEL: {self.max_error}")
         return self.__solver_result(binding, best_point) | {"converged": False, "maxError": self.max_error,
-                                                            "iterations": self.__max_iterations, "projections": guess_num - 1}
+                                                            "iterations": self.__max_iterations, "projections": guess_num - 1,
+                                                            "scenarioRuns": scenario_runs}
 
     # Returns the solver result for a scenario's point
     @staticmethod
@@ -771,28 +831,14 @@ class SbaSolver:
         return {"bel": point["value"], "tolerance": abs(point["result"]), "endingAssets": point["result"],
                 "projectionId": point["projectionId"], "scenario": scenario}
 
-    # The BEL has converged when the scenario with the highest converged starting assets is within tolerance, and every
-    # other scenario has a result at or below that starting value that is either within tolerance or has ending assets
-    # >= 0 (so it needs fewer assets and doesn't set the BEL). Returns the solver result, or None if not converged
-    def __check_convergence(self, guesses: dict[int, list[dict]]) -> dict | None:
-        converged = {}
-        for scenario, points in guesses.items():
-            within = [point for point in points if abs(point["result"]) <= self.__tolerance]
-            if within:
-                converged[scenario] = min(within, key=lambda point: abs(point["result"]))
-        if not converged:
-            return None
-
-        binding = max(converged, key=lambda scenario: converged[scenario]["value"])
-        bel = converged[binding]["value"]
-        for scenario, points in guesses.items():
-            if scenario == binding:
-                continue
-            if not any(point["value"] <= bel and (point["result"] >= 0 or abs(point["result"]) <= self.__tolerance)
-                       for point in points):
-                return None
-
-        return self.__solver_result(binding, converged[binding]) | {"converged": True}
+    # Log the scenarios whose status just changed
+    @staticmethod
+    def __log_status_changes(changed: dict[int, ScenarioStatus]):
+        for current in (ScenarioStatus.CONVERGED, ScenarioStatus.NON_BINDING):
+            scenarios = sorted(scenario for scenario, new_status in changed.items() if new_status == current)
+            if scenarios:
+                logging.info(f"Scenarios {scenarios} are now {current.value} and will no longer be solved. They are still run at "
+                             f"a guess with enough assets, so the final projection has every scenario")
 
     def __start_run(self, starting_assets: list[float], time_index, projection_params, guess_num: int, use_epl: bool) -> int:
         # Write new starting asset values to a table
@@ -822,7 +868,8 @@ class SbaSolver:
             if use_epl:
                 self.__setup_first_solver_projection(projection_id)
 
-        self.api.update_projection(projection_id, projection_params)
+        # Every run has every scenario ("" is no scenario filter)
+        self.api.update_projection(projection_id, projection_params | {"scenarioSubset": ""})
 
         # Set starting assets table
         self.api.update_projection_table(projection_id, settings.starting_asset_table_name, starting_assets_table_id)
@@ -832,86 +879,9 @@ class SbaSolver:
         self.api.run_projection(projection_id)
         return projection_id
 
-    # Returns the next round of guesses as [low, mid, high] lists of starting assets indexed by scenario, plus the solver
-    # state of each scenario. Scenarios without results keep the default guess
-    def __solve_next_guess(self, prior_results: dict[int, list[dict]], default_guess: float) -> tuple[list[list[float]], dict[int, dict]]:
-        size = max(SbaSolver.SCALING_TABLE_ROWS, max(prior_results, default=-1) + 1)
-        next_guesses = [[default_guess] * size for _ in range(3)]
-        states = {}
-        for scenario, points in prior_results.items():
-            states[scenario] = self.__next_scenario_guesses(points)
-            for k in range(3):
-                next_guesses[k][scenario] = states[scenario]["guesses"][k]
-        return next_guesses, states
-
-    # Work out the next 3 guesses for a scenario from all of its results so far. The mid guess is the best estimate of the
-    # starting assets that give 0 ending assets. The low and high guesses are placed either side of it by how uncertain
-    # that estimate is, so that the next round is likely to bracket the answer closely
-    def __next_scenario_guesses(self, points: list[dict]) -> dict:
-        below = [point for point in points if point["result"] < 0]
-        above = [point for point in points if point["result"] >= 0]
-        best = min(points, key=lambda point: abs(point["result"]))
-        state = {"runs": len(points), "best": best, "lower": None, "upper": None}
-
-        if below and above:
-            # Bracketed - the answer lies between the closest results either side of 0
-            low = max(below, key=lambda point: point["result"])
-            high = min(above, key=lambda point: point["result"])
-            lower, upper = sorted((low["value"], high["value"]))
-            state.update(lower=lower, upper=upper)
-            slope = (high["result"] - low["result"]) / (high["value"] - low["value"]) if high["value"] != low["value"] else 0
-            if slope <= 0:
-                # Ending assets don't increase with starting assets across the bracket - split the bracket instead
-                estimate, spread, method = (lower + upper) / 2, (upper - lower) / 4, "bisection"
-            else:
-                # Secant estimate, improved with inverse quadratic interpolation through a third result if it stays
-                # inside the bracket. The difference between the two estimates measures how uncertain the estimate is
-                estimate = high["value"] - high["result"] / slope
-                spread, method = (upper - lower) / 4, "secant"
-                third = next((point for point in sorted(points, key=lambda point: abs(point["result"]))
-                              if point["result"] not in (low["result"], high["result"])), None)
-                if third is not None:
-                    quadratic = SbaSolver.__inverse_quadratic(low, high, third)
-                    if lower < quadratic < upper:
-                        spread = abs(quadratic - estimate)
-                        estimate, method = quadratic, "inverse quadratic"
-                # Space the guesses at least the starting assets equivalent of the tolerance apart
-                spread = max(spread, self.__tolerance / slope)
-            # Keep the low and high guesses inside the bracket
-            guesses = [max(estimate - spread, (lower + estimate) / 2), estimate, min(estimate + spread, (estimate + upper) / 2)]
-        else:
-            # Not bracketed - extrapolate from the 2 results closest to 0, limited to 4 times the range tried so far
-            other = next((point for point in sorted(points, key=lambda point: abs(point["result"]))
-                          if point["value"] != best["value"]), None)
-            slope = (best["result"] - other["result"]) / (best["value"] - other["value"]) if other else 0
-            if slope <= 0:
-                # No usable slope - step 1% towards 0 ending assets
-                step, method = (1 if best["result"] < 0 else -1) * abs(best["value"]) * 0.01, "step"
-                spread = abs(step) / 4
-            else:
-                step = -best["result"] / slope
-                values = [point["value"] for point in points]
-                max_step = 4 * (max(values) - min(values))
-                step, method = max(-max_step, min(max_step, step)), "extrapolation"
-                spread = max(abs(step) / 4, self.__tolerance / slope)
-            estimate = best["value"] + step
-            guesses = [estimate - spread, estimate, estimate + spread]
-
-        state.update(estimate=estimate, method=method, guesses=guesses)
-        return state
-
-    # Inverse quadratic interpolation through 3 results: the starting assets estimated to give 0 ending assets
-    @staticmethod
-    def __inverse_quadratic(p0: dict, p1: dict, p2: dict) -> float:
-        x0, x1, x2 = p0["value"], p1["value"], p2["value"]
-        f0, f1, f2 = p0["result"], p1["result"], p2["result"]
-        return (x0 * f1 * f2 / ((f0 - f1) * (f0 - f2))
-                + x1 * f0 * f2 / ((f1 - f0) * (f1 - f2))
-                + x2 * f0 * f1 / ((f2 - f0) * (f2 - f1)))
-
     # Log the state of each scenario after a round of guesses
     @staticmethod
-    def __log_solver_state(iteration: int, states: dict[int, dict]):
+    def __log_solver_state(iteration: int, states: dict[int, dict], status: dict[int, ScenarioStatus]):
         rows = [{"Scenario": scenario,
                  "Runs": state["runs"],
                  "Best Start": state["best"]["value"],
@@ -924,5 +894,8 @@ class SbaSolver:
                  "Next High": state["guesses"][2]}
                 for scenario, state in sorted(states.items())]
         binding = max(states, key=lambda scenario: states[scenario]["estimate"])
-        logging.info(f"Solver state after round {iteration} - highest estimated BEL is scenario {binding} at "
+        counts = {current: sum(1 for value in status.values() if value == current) for current in ScenarioStatus}
+        logging.info(f"Solver state after round {iteration} - {counts[ScenarioStatus.ACTIVE]} scenarios still to solve, "
+                     f"{counts[ScenarioStatus.CONVERGED]} converged, {counts[ScenarioStatus.NON_BINDING]} non-binding. "
+                     f"Highest estimated BEL of those still to solve is scenario {binding} at "
                      f"{states[binding]['estimate']:,.2f}:\n{pd.DataFrame(rows).to_string(index=False)}")
